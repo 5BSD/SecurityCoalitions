@@ -820,50 +820,83 @@ vbsd_jail_osd_dtor(void *value)
 	struct vbsd_jail_osd *vjo = value;
 	struct vbsd_coalition *vc;
 	struct vbsd_member *vm;
-	struct thread *td;
-	int dtype;
 
 	if (vjo == NULL)
 		return;
-
-	td = curthread;
-	KASSERT(td != NULL, ("vbsd_jail_osd_dtor: NULL curthread"));
-	KASSERT((td->td_pflags & TDP_ITHREAD) == 0,
-	    ("vbsd_jail_osd_dtor: called from interrupt thread"));
 
 	vc = vjo->vjo_coalition;
 	vm = vjo->vjo_member;
 
 	/*
-	 * If this jail was enlisted as a member (not just for inheritance),
-	 * remove it from the coalition now that the prison is being freed.
+	 * If this jail was enlisted as a member, we need to clean up.
+	 * However, we must be careful about races with fo_close:
+	 *
+	 * Scenario A: fo_close runs first
+	 *   - fo_close clears vjo_member to NULL
+	 *   - fo_close calls prison_remove, triggering this destructor
+	 *   - We see vm == NULL, skip member cleanup
+	 *   - fo_close frees vm (it's in jail_list)
+	 *
+	 * Scenario B: Prison freed first (e.g., jail -r while coalition open)
+	 *   - This destructor runs with vm != NULL
+	 *   - We remove from TAILQ and release refs
+	 *   - We DON'T free vm - fo_close will do it (or it leaks if fd leaked)
+	 *   - Later fo_close sees member not in TAILQ, handles appropriately
+	 *
+	 * The key insight: we should NEVER free vm here. Either fo_close
+	 * already freed it (vm == NULL), or fo_close will free it later.
 	 */
 	if (vm != NULL) {
-		dtype = vm->vm_dtype;
+		int dtype = vm->vm_dtype;
+		struct thread *td = curthread;
+		bool in_tailq;
 
+		KASSERT(td != NULL, ("vbsd_jail_osd_dtor: NULL curthread"));
+		KASSERT((td->td_pflags & TDP_ITHREAD) == 0,
+		    ("vbsd_jail_osd_dtor: called from interrupt thread"));
+
+		/*
+		 * Check if member is still in TAILQ. fo_close sets tqe_prev
+		 * to NULL after removing, so we can detect if already removed.
+		 */
 		sx_xlock(&vc->vc_sx);
-		TAILQ_REMOVE(&vc->vc_members, vm, vm_link);
+		in_tailq = (vm->vm_link.tqe_prev != NULL);
+		if (in_tailq) {
+			TAILQ_REMOVE(&vc->vc_members, vm, vm_link);
+			vm->vm_link.tqe_prev = NULL;  /* Mark as removed */
+		}
 		sx_xunlock(&vc->vc_sx);
 
-		atomic_subtract_int(&vc->vc_member_count, 1);
-		vbsd_member_ops_release(dtype);
+		/*
+		 * If we removed from TAILQ, we own the cleanup.
+		 * If fo_close already removed it, fo_close owns cleanup.
+		 */
+		if (in_tailq) {
+			atomic_subtract_int(&vc->vc_member_count, 1);
+			vbsd_member_ops_release(dtype);
 
-		/* Release file reference */
-		if (vm->vm_fp != NULL)
-			fdrop(vm->vm_fp, td);
+			/* Release file reference */
+			if (vm->vm_fp != NULL)
+				fdrop(vm->vm_fp, td);
 
-		/* Free member data */
-		if (vm->vm_data != NULL)
-			free(vm->vm_data, M_VBSD_COALITION);
+			/* Free member data and member struct */
+			if (vm->vm_data != NULL)
+				free(vm->vm_data, M_VBSD_COALITION);
 
-		uma_zfree(vbsd_member_zone, vm);
+			uma_zfree(vbsd_member_zone, vm);
 
-		/* Release member's coalition reference */
-		vbsd_coalition_rel(vc);
+			/* Release member's coalition reference */
+			vbsd_coalition_rel(vc);
+		}
+		/* If !in_tailq, fo_close will free vm */
 	}
 
-	/* Release inheritance coalition reference */
-	vbsd_coalition_rel(vc);
+	/*
+	 * Release OSD's coalition reference and free OSD structure.
+	 * This reference was taken in vbsd_jail_set_coalition_atomic().
+	 */
+	if (vc != NULL)
+		vbsd_coalition_rel(vc);
 	free(vjo, M_VBSD_COALITION);
 }
 
@@ -1918,7 +1951,12 @@ vbsd_coalition_fo_close(struct file *fp, struct thread *td)
 		TAILQ_REMOVE(&vc->vc_members, vm, vm_link);
 
 		if (vm->vm_ops == &vbsd_jail_ops) {
-			/* Collect jails separately for deferred termination */
+			/*
+			 * Collect jails separately for deferred termination.
+			 * Mark tqe_prev as NULL so the OSD destructor knows
+			 * we already removed this member from the TAILQ.
+			 */
+			vm->vm_link.tqe_prev = NULL;
 			*jail_tailp = vm;
 			jail_tailp = (struct vbsd_member **)&vm->vm_link.tqe_next;
 			continue;
