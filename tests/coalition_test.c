@@ -98,30 +98,74 @@ create_test_jail(const char *name)
 
 /*
  * Create a non-owning jail descriptor for an existing jail.
+ * Use stack buffers to ensure memory is writable and properly aligned.
  */
 static int
 get_jail_desc(const char *name)
 {
 	struct iovec iov[4];
+	char nameparam[8];
+	char namebuf[256];
+	char descparam[8];
 	int jail_fd;
 	int ret;
 
-	iov[0].iov_base = __DECONST(char *, "name");
-	iov[0].iov_len = sizeof("name");
-	iov[1].iov_base = __DECONST(char *, name);
-	iov[1].iov_len = strlen(name) + 1;
-	iov[2].iov_base = __DECONST(char *, "desc");
-	iov[2].iov_len = sizeof("desc");
+	/* Copy to stack buffers to ensure writeable memory */
+	strlcpy(nameparam, "name", sizeof(nameparam));
+	strlcpy(namebuf, name, sizeof(namebuf));
+	strlcpy(descparam, "desc", sizeof(descparam));
+
+	iov[0].iov_base = nameparam;
+	iov[0].iov_len = strlen(nameparam) + 1;
+	iov[1].iov_base = namebuf;
+	iov[1].iov_len = strlen(namebuf) + 1;
+	iov[2].iov_base = descparam;
+	iov[2].iov_len = strlen(descparam) + 1;
 	jail_fd = -1;
 	iov[3].iov_base = &jail_fd;
 	iov[3].iov_len = sizeof(jail_fd);
 
 	ret = jail_get(iov, 4, JAIL_GET_DESC);
-	if (ret < 0)
+	if (ret < 0) {
+		fprintf(stderr, "DEBUG: get_jail_desc(%s) jail_get failed: %s (errno=%d)\n",
+		    name, strerror(errno), errno);
 		return (-1);
-	if (jail_fd < 0)
+	}
+	if (jail_fd < 0) {
+		fprintf(stderr, "DEBUG: get_jail_desc(%s) jail_fd is -1 (ret=%d)\n",
+		    name, ret);
 		return (-1);
+	}
 	return (jail_fd);
+}
+
+/*
+ * Get the jail ID for an existing jail by name.
+ * Use stack buffers to ensure memory is writable and properly aligned.
+ */
+static int
+get_jail_id(const char *name)
+{
+	struct iovec iov[2];
+	char nameparam[8];
+	char namebuf[256];
+	int jid;
+
+	/* Copy to stack buffers to ensure writeable memory */
+	strlcpy(nameparam, "name", sizeof(nameparam));
+	strlcpy(namebuf, name, sizeof(namebuf));
+
+	iov[0].iov_base = nameparam;
+	iov[0].iov_len = strlen(nameparam) + 1;
+	iov[1].iov_base = namebuf;
+	iov[1].iov_len = strlen(namebuf) + 1;
+
+	jid = jail_get(iov, 2, 0);
+	if (jid < 0) {
+		fprintf(stderr, "DEBUG: get_jail_id(%s) failed: %s (errno=%d)\n",
+		    name, strerror(errno), errno);
+	}
+	return (jid);
 }
 
 /* =========================================================================
@@ -903,7 +947,6 @@ test_jail_fork_inheritance(void)
 	pid_t pid;
 	char buf;
 	int jid;
-	struct iovec iov[2];
 
 	if (geteuid() != 0)
 		return TEST_PASS("Skipped (not root)");
@@ -919,12 +962,7 @@ test_jail_fork_inheritance(void)
 	}
 
 	/* Get the jail ID for jail_attach */
-	iov[0].iov_base = __DECONST(char *, "name");
-	iov[0].iov_len = sizeof("name");
-	iov[1].iov_base = __DECONST(char *, "coalition_test_jail_fork");
-	iov[1].iov_len = sizeof("coalition_test_jail_fork");
-
-	jid = jail_get(iov, 2, 0);
+	jid = get_jail_id("coalition_test_jail_fork");
 	if (jid < 0) {
 		close(jail_fd);
 		close(coal_fd);
@@ -1034,7 +1072,6 @@ test_terminate_removes_jails(void)
 {
 	int coal_fd, jail_fd;
 	int jid;
-	struct iovec iov[2];
 
 	if (geteuid() != 0)
 		return TEST_PASS("Skipped (not root)");
@@ -1050,12 +1087,7 @@ test_terminate_removes_jails(void)
 	}
 
 	/* Get the jail ID to check existence later */
-	iov[0].iov_base = __DECONST(char *, "name");
-	iov[0].iov_len = sizeof("name");
-	iov[1].iov_base = __DECONST(char *, "coalition_test_jail_term");
-	iov[1].iov_len = sizeof("coalition_test_jail_term");
-
-	jid = jail_get(iov, 2, 0);
+	jid = get_jail_id("coalition_test_jail_term");
 	TEST_ASSERT(jid > 0, "Failed to get jail ID before enlistment");
 
 	/* Enlist the jail - jail_caller keeps fd (reference semantics) */
@@ -1077,8 +1109,8 @@ test_terminate_removes_jails(void)
 	usleep(100000);  /* 100ms */
 
 	/* Check if the jail still exists - it should be gone or dying */
-	jid = jail_get(iov, 2, 0);
-	/* jail_get returns -1 with ENOENT if jail doesn't exist */
+	jid = get_jail_id("coalition_test_jail_term");
+	/* get_jail_id returns -1 if jail doesn't exist */
 	TEST_ASSERT(jid < 0, "Jail should be removed after coalition terminate");
 
 	close(coal_fd);

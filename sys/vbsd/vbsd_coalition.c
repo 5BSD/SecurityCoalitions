@@ -455,25 +455,33 @@ vbsd_jail_terminate(struct file *fp, struct thread *td __unused)
 	/*
 	 * Call prison_remove to kill all processes in the jail.
 	 *
-	 * Note: prison_remove() internally calls prison_deref() with PD_DEREF
-	 * for child prisons (those with pr_parent != NULL). Since any jail
-	 * created by users is a child of prison0, this applies to all jails
-	 * we'd terminate. Our prison_hold() above keeps the prison alive
-	 * during the remove, and prison_remove's deref balances our hold.
+	 * prison_remove() requires:
+	 * 1. allprison_lock held exclusively (sx_xlock)
+	 * 2. pr->pr_mtx held (mtx_lock)
+	 * 3. A reference held on the prison (prison_hold)
 	 *
-	 * Do NOT call prison_free() after prison_remove() - that would drop
-	 * an extra reference and trigger premature prison destruction while
-	 * the coalition lock may be held (from fo_close -> terminate_members),
-	 * causing the OSD destructor to deadlock on vc->vc_sx.
+	 * prison_remove() internally calls prison_deref() with
+	 * PD_DEREF | PD_LOCKED | PD_LIST_XLOCKED, which releases:
+	 * - Our held reference (PD_DEREF)
+	 * - The prison mutex (PD_LOCKED)
+	 * - The allprison_lock (PD_LIST_XLOCKED)
+	 *
+	 * So after prison_remove() returns, all locks are released.
 	 */
-	if (prison_isvalid(pr)) {
+	sx_xlock(&allprison_lock);
+	mtx_lock(&pr->pr_mtx);
+
+	if (prison_isalive(pr)) {
+		log(LOG_DEBUG, "vbsd_coalition: jail_terminate: removing jail %d\n",
+		    pr->pr_id);
 		prison_remove(pr);
+		/* prison_remove releases locks and reference */
 	} else {
 		/*
-		 * Prison is already invalid/dying. Release our hold reference.
-		 * This is safe because prison destruction already started
-		 * through another path (e.g., owning descriptor closed).
+		 * Prison is already dying. Release locks and our reference.
 		 */
+		mtx_unlock(&pr->pr_mtx);
+		sx_xunlock(&allprison_lock);
 		prison_free(pr);
 	}
 
@@ -1337,6 +1345,10 @@ vbsd_coalition_terminate_members_locked(struct vbsd_coalition *vc,
 static int
 vbsd_coalition_terminate(struct vbsd_coalition *vc)
 {
+	struct vbsd_member *vm;
+	struct thread *td = curthread;
+	struct file **jail_fps;
+	int jail_count, i;
 
 	sx_xlock(&vc->vc_sx);
 
@@ -1350,9 +1362,56 @@ vbsd_coalition_terminate(struct vbsd_coalition *vc)
 		return (ESHUTDOWN);
 	}
 
-	vbsd_coalition_terminate_members_locked(vc, curthread, false);
+	/*
+	 * Count jail members so we can allocate an array to hold their
+	 * file pointers. We need to terminate jails outside the lock
+	 * to avoid deadlock with OSD destructor.
+	 */
+	jail_count = 0;
+	TAILQ_FOREACH(vm, &vc->vc_members, vm_link) {
+		if (vm->vm_ops == &vbsd_jail_ops && vm->vm_fp != NULL)
+			jail_count++;
+	}
+
+	jail_fps = NULL;
+	if (jail_count > 0) {
+		jail_fps = malloc(jail_count * sizeof(struct file *),
+		    M_VBSD_COALITION, M_NOWAIT);
+		if (jail_fps != NULL) {
+			i = 0;
+			TAILQ_FOREACH(vm, &vc->vc_members, vm_link) {
+				if (vm->vm_ops == &vbsd_jail_ops &&
+				    vm->vm_fp != NULL && i < jail_count) {
+					/* Hold file reference for safe access outside lock */
+					if (fhold(vm->vm_fp))
+						jail_fps[i++] = vm->vm_fp;
+				}
+			}
+			jail_count = i;  /* Actual count after fhold */
+		} else {
+			jail_count = 0;
+		}
+	}
+
+	/* Terminate non-jail members while holding the lock */
+	vbsd_coalition_terminate_members_locked(vc, td, false);
 
 	sx_xunlock(&vc->vc_sx);
+
+	/*
+	 * Terminate jail members outside the lock to avoid deadlock.
+	 * vbsd_jail_terminate() needs allprison_lock which could deadlock
+	 * with OSD destructor that needs vc_sx.
+	 */
+	for (i = 0; i < jail_count; i++) {
+		log(LOG_DEBUG, "vbsd_coalition: terminate: terminating jail %d/%d\n",
+		    i + 1, jail_count);
+		(void)vbsd_jail_terminate(jail_fps[i], td);
+		fdrop(jail_fps[i], td);
+	}
+
+	if (jail_fps != NULL)
+		free(jail_fps, M_VBSD_COALITION);
 
 	return (0);
 }
@@ -1999,12 +2058,10 @@ vbsd_coalition_fo_close(struct file *fp, struct thread *td)
 	/*
 	 * Now terminate and clean up jail members without holding vc_sx.
 	 *
-	 * We access the prison through the jaildesc file (vm->vm_fp->f_data)
-	 * to get the current prison pointer, as the jaildesc may have updated
-	 * its pointer since we enlisted.
-	 *
-	 * We clear the OSD's back-pointer so the OSD destructor (which runs
-	 * when prison is freed) won't try to access this already-freed member.
+	 * CRITICAL: We must clear vjo_member BEFORE calling prison_remove,
+	 * because prison_remove triggers the OSD destructor. If vjo_member
+	 * is still set, the destructor would try to TAILQ_REMOVE the member
+	 * that we already removed above, corrupting the list.
 	 */
 	for (vm = jail_list; vm != NULL; ) {
 		struct vbsd_member *next = (struct vbsd_member *)vm->vm_link.tqe_next;
@@ -2016,14 +2073,9 @@ vbsd_coalition_fo_close(struct file *fp, struct thread *td)
 		vjd = vm->vm_data;
 
 		/*
-		 * Clear the OSD's member pointer BEFORE we call fdrop.
-		 * fdrop may trigger prison_free -> OSD destructor.
-		 * If vjo->vjo_member is still set, the destructor would do
-		 * duplicate cleanup (TAILQ_REMOVE, fdrop, free) causing
-		 * double-free and list corruption.
-		 *
-		 * By setting vjo_member = NULL, the destructor skips member
-		 * cleanup and only releases the OSD's coalition reference.
+		 * Step 1: Clear the OSD's member pointer FIRST.
+		 * This MUST happen before prison_remove/fdrop to prevent
+		 * the OSD destructor from doing duplicate TAILQ_REMOVE.
 		 */
 		if (vm->vm_fp != NULL && vm->vm_fp->f_data != NULL) {
 			jd = vm->vm_fp->f_data;
@@ -2045,13 +2097,23 @@ vbsd_coalition_fo_close(struct file *fp, struct thread *td)
 			}
 		}
 
+		/*
+		 * Step 2: Terminate the jail (kill processes).
+		 * Now safe to call because vjo_member is NULL.
+		 */
+		if (vm->vm_fp != NULL && vm->vm_ops != NULL &&
+		    vm->vm_ops->mo_terminate != NULL) {
+			log(LOG_DEBUG, "vbsd_coalition: fo_close: terminating jail\n");
+			(void)vm->vm_ops->mo_terminate(vm->vm_fp, td);
+		}
+
 		if (vjd != NULL)
 			vjd->vjd_prison = NULL;
 
 		atomic_subtract_int(&vc->vc_member_count, 1);
 		vbsd_member_ops_release(vm->vm_dtype);
 
-		/* Release file reference - may trigger OSD destructor */
+		/* Release file reference */
 		if (vm->vm_fp != NULL)
 			fdrop(vm->vm_fp, td);
 

@@ -1,28 +1,33 @@
 # SecurityCoalitions TODO
 
-## Jail Termination Issue (Deferred)
+## Completed
 
-The `prison_remove()` call crashes in FreeBSD 15 with a page fault at offset 0x20 in `prison_deref`. This needs investigation into FreeBSD 15's jail/prison API changes.
+### Jail Termination (Fixed)
 
-### Current Workaround
-- Jails are cleaned up via `fdrop()` on the jaildesc file descriptor
-- The OSD member pointer is cleared before cleanup to prevent double-free
-- Jails are NOT actively terminated (processes inside not killed)
+All jail tests now pass. The following issues were resolved:
 
-### Failing Jail Tests
-- `test_enlist_jail_twice_fails` - Failed to get second jaildesc
-- `test_terminate_removes_jails` - Failed to get jail ID before enlistment
-- `test_jail_fork_inheritance` - Failed to get jail ID
-- `test_enlist_jail_via_different_desc` - Failed to get second jaildesc
+1. **Missing locks on `prison_remove()`** - Fixed by acquiring `allprison_lock` (exclusive) and `pr->pr_mtx` before calling `prison_remove()`. These locks are required by the FreeBSD jail API.
 
-### Investigation Notes
-- Crash occurs in `prison_deref` called from `prison_remove`
-- Stack trace shows `__mtx_unlock_sleep` trying to unlock a mutex
-- Fault address 0x20 suggests NULL pointer + offset access
-- May be related to jaildesc/prison reference counting changes in FreeBSD 15
+2. **Jails not being terminated** - Fixed by adding jail termination calls in both `vbsd_coalition_terminate()` (for explicit TERMINATE ioctl) and `fo_close()` (for implicit termination on close).
 
-### Next Steps
-1. Review FreeBSD 15 jail.h and prison struct changes
-2. Check if `prison_remove` semantics changed
-3. Consider using jail(2) syscall instead of direct prison_* calls
-4. Test with simpler jail creation/destruction outside coalition context
+3. **OSD destructor race condition** - Fixed by clearing `vjo->vjo_member = NULL` BEFORE calling `prison_remove()`. This prevents the OSD destructor from doing a duplicate `TAILQ_REMOVE` on an already-removed member.
+
+4. **Test EFAULT errors** - Fixed by using stack buffers for `jail_get()` parameters instead of const string literals. FreeBSD 15's kernel had issues reading const pointers.
+
+## Known Issues
+
+### Lingering Test Processes
+
+Some tests may leave zombie or orphaned processes. These are typically:
+- Zombie children waiting to be reaped (`<defunct>`)
+- Orphaned children blocked in `pause()`
+
+Workaround: `pkill -9 coalition_test` after test runs.
+
+Root cause: Tests using `pdfork()` with `PD_DAEMON` flag reparent children to init. If the coalition termination doesn't kill them before the test exits, they become orphans.
+
+## Future Enhancements
+
+- Consider reducing LOG_WARNING messages to LOG_DEBUG for production
+- Add more comprehensive jail + process interaction tests
+- Test jail termination with active processes inside the jail
