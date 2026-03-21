@@ -107,13 +107,20 @@ test_harness_summary(void)
 int
 create_coalition(void)
 {
-	int fd;
+	int fd, flags;
 
-	fd = open("/dev/coalition", O_RDWR);
+	fd = open("/dev/coalition", O_RDWR | O_CLOFORK);
 	if (fd < 0 && errno == ENOENT) {
 		fprintf(stderr, "ERROR: /dev/coalition not found.\n");
 		fprintf(stderr, "Is the vbsd_coalition module loaded?\n");
 		fprintf(stderr, "Run: kldload ./sys/modules/vbsd_coalition/vbsd_coalition.ko\n");
+		return fd;
+	}
+	if (fd >= 0) {
+		/* Ensure FD_CLOFORK is set - prevents children from inheriting */
+		flags = fcntl(fd, F_GETFD);
+		if (flags >= 0)
+			(void)fcntl(fd, F_SETFD, flags | FD_CLOFORK);
 	}
 	return fd;
 }

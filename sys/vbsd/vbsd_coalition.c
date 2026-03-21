@@ -262,9 +262,6 @@ static u_int vbsd_jail_osd_slot;
 static eventhandler_tag vbsd_fork_tag;
 static eventhandler_tag vbsd_exit_tag;
 
-/* Debug sequence counter for ordering log messages */
-static volatile u_int vbsd_debug_seq;
-#define VBSD_SEQ() atomic_fetchadd_int(&vbsd_debug_seq, 1)
 
 /* Forward declarations */
 static fo_ioctl_t	vbsd_coalition_fo_ioctl;
@@ -283,9 +280,9 @@ static void		vbsd_coalition_terminate_members_locked(
  * Defaults are generous but prevent unbounded growth.
  * Set to 0 to disable limit (unlimited).
  */
-#define VBSD_DEFAULT_MAX_COALITIONS	4096
-#define VBSD_DEFAULT_MAX_MEMBERS	65536
-#define VBSD_DEFAULT_MAX_MEMBERS_PER	1024
+#define VBSD_DEFAULT_MAX_COALITIONS	0	/* 0 = unlimited */
+#define VBSD_DEFAULT_MAX_MEMBERS	0	/* 0 = unlimited */
+#define VBSD_DEFAULT_MAX_MEMBERS_PER	0	/* 0 = unlimited */
 #define VBSD_DEFAULT_ENLIST_SET_MAX	1024
 
 static u_int vbsd_max_coalitions = VBSD_DEFAULT_MAX_COALITIONS;
@@ -389,22 +386,13 @@ vbsd_proc_terminate(struct file *fp, struct thread *td __unused)
 	p = pd->pd_proc;
 	if (p == NULL) {
 		sx_sunlock(&proctree_lock);
-		/*
-		 * Process already exited. This is not an error condition -
-		 * the process is already dead, which is what we wanted.
-		 * Return 0 to indicate success (no action needed).
-		 */
-		log(LOG_WARNING, "vbsd_coalition: proc_terminate: pd=%p pd->pd_proc is NULL (process already exited)\n", pd);
+		/* Process already exited - success (already dead). */
 		return (0);
 	}
-	log(LOG_WARNING, "vbsd_coalition: proc_terminate: sending SIGKILL to pid=%d\n",
-	    p->p_pid);
 	PROC_LOCK(p);
 	sx_sunlock(&proctree_lock);
 	kern_psignal(p, SIGKILL);
 	PROC_UNLOCK(p);
-	log(LOG_WARNING, "vbsd_coalition: proc_terminate: SIGKILL sent to pid=%d\n",
-	    p->p_pid);
 
 	return (0);
 }
@@ -432,21 +420,14 @@ vbsd_jail_terminate(struct file *fp, struct thread *td __unused)
 	struct jaildesc *jd;
 	struct prison *pr;
 
-	if (fp == NULL) {
-		log(LOG_WARNING, "vbsd_coalition: jail_terminate: NULL fp\n");
-		return (EINVAL);
-	}
-	if (fp->f_data == NULL) {
-		log(LOG_WARNING, "vbsd_coalition: jail_terminate: NULL f_data\n");
-		return (EINVAL);
-	}
+	KASSERT(fp != NULL, ("vbsd_jail_terminate: NULL fp"));
+	KASSERT(fp->f_data != NULL, ("vbsd_jail_terminate: NULL f_data"));
 
 	jd = fp->f_data;
 	JAILDESC_LOCK(jd);
 	pr = jd->jd_prison;
 	if (pr == NULL || !prison_isvalid(pr)) {
 		JAILDESC_UNLOCK(jd);
-		log(LOG_DEBUG, "vbsd_coalition: jail_terminate: prison invalid\n");
 		return (ENOENT);
 	}
 	prison_hold(pr);
@@ -472,8 +453,6 @@ vbsd_jail_terminate(struct file *fp, struct thread *td __unused)
 	mtx_lock(&pr->pr_mtx);
 
 	if (prison_isalive(pr)) {
-		log(LOG_DEBUG, "vbsd_coalition: jail_terminate: removing jail %d\n",
-		    pr->pr_id);
 		prison_remove(pr);
 		/* prison_remove releases locks and reference */
 	} else {
@@ -652,10 +631,9 @@ vbsd_coalition_alloc(void)
 	TAILQ_INIT(&vc->vc_members);
 	vc->vc_signal = SIGKILL;	/* Default to immediate termination */
 	vc->vc_nesting_depth = 0;
-	vc->vc_flags = 0;	/* Explicitly clear flags */
+	vc->vc_flags = 0;
 	refcount_init(&vc->vc_refcount, 1);
 	atomic_add_int(&vbsd_coalition_count, 1);
-	log(LOG_WARNING, "vbsd_coalition: alloc: vc=%p flags=%u\n", vc, vc->vc_flags);
 
 	return (vc);
 }
@@ -711,27 +689,6 @@ vbsd_coalition_init_file(struct file *fp)
 	SDT_PROBE1(coalition, , , create, curthread->td_proc->p_pid);
 
 	return (0);
-}
-
-static void
-vbsd_coalition_mark_clofork(struct thread *td, struct file *fp)
-{
-	struct filedesc *fdp;
-	struct filedescent *fde;
-	int i;
-
-	if (td == NULL || td->td_proc == NULL)
-		return;
-
-	/* Prevent implicit inheritance; coalition fds must be passed explicitly. */
-	fdp = td->td_proc->p_fd;
-	FILEDESC_XLOCK(fdp);
-	for (i = 0; i < fdp->fd_nfiles; i++) {
-		fde = &fdp->fd_ofiles[i];
-		if (fde->fde_file == fp)
-			fde->fde_flags |= UF_FOCLOSE;
-	}
-	FILEDESC_XUNLOCK(fdp);
 }
 
 /* ========================================================================
@@ -1020,8 +977,6 @@ vbsd_coalition_enlist_generic(struct vbsd_coalition *vc, struct thread *td,
 			return (ESRCH);
 		}
 		vpd->vpd_proc = p;
-		log(LOG_DEBUG, "vbsd_coalition: [%u] enlist_procdesc: pd=%p pid=%d\n",
-		    VBSD_SEQ(), pd, p->p_pid);
 
 		/*
 		 * Take hash lock BEFORE releasing proctree_lock to close
@@ -1155,8 +1110,6 @@ vbsd_coalition_enlist_generic(struct vbsd_coalition *vc, struct thread *td,
 	vm->vm_ops = ops;
 	vm->vm_coalition = vc;
 	TAILQ_INSERT_TAIL(&vc->vc_members, vm, vm_link);
-	log(LOG_WARNING, "vbsd_coalition: enlist: vc=%p added member dtype=%d fp=%p, count now %u\n",
-	    vc, dtype, fp, vc->vc_member_count + 1);
 
 	/*
 	 * For jails, set the member back-pointer in the OSD so the
@@ -1255,29 +1208,21 @@ vbsd_coalition_terminate_members_locked(struct vbsd_coalition *vc,
 	struct vbsd_member *vm;
 	struct proc *self;
 	int error;
-	u_int count;
 
 	sx_assert(&vc->vc_sx, SA_XLOCKED);
 
-	if (vc->vc_flags & VCF_TERMINATING) {
-		log(LOG_WARNING, "vbsd_coalition: terminate: already terminating (skipping)\n");
+	if (vc->vc_flags & VCF_TERMINATING)
 		return;
-	}
 
 	vc->vc_flags |= VCF_TERMINATING;
-	count = vc->vc_member_count;
-	log(LOG_WARNING, "vbsd_coalition: terminate: starting, %u members\n", count);
 
 	/* Close path may need to avoid killing the closing process itself. */
 	self = (skip_self && td != NULL) ? td->td_proc : NULL;
 
 	/* Terminate all members via their ops */
 	TAILQ_FOREACH(vm, &vc->vc_members, vm_link) {
-		if (vm->vm_ops == NULL) {
-			log(LOG_WARNING,
-			    "vbsd_coalition: terminate: NULL vm_ops, skipping\n");
+		if (vm->vm_ops == NULL)
 			continue;
-		}
 
 		/*
 		 * Skip jail members - they must be terminated OUTSIDE the
@@ -1285,20 +1230,11 @@ vbsd_coalition_terminate_members_locked(struct vbsd_coalition *vc,
 		 * OSD destructor which tries to take vc_sx.
 		 * Caller (fo_close) handles jail termination after unlocking.
 		 */
-		if (vm->vm_ops == &vbsd_jail_ops) {
-			log(LOG_DEBUG, "vbsd_coalition: terminate: deferring jail termination\n");
+		if (vm->vm_ops == &vbsd_jail_ops)
 			continue;
-		}
-
-		log(LOG_WARNING, "vbsd_coalition: terminate: member dtype=%d fp=%p ops=%s\n",
-		    vm->vm_dtype, vm->vm_fp, vm->vm_ops->mo_name);
 
 		if (vm->vm_fp != NULL && vm->vm_ops->mo_terminate != NULL) {
-			log(LOG_WARNING, "vbsd_coalition: terminate: calling mo_terminate for %s\n",
-			    vm->vm_ops->mo_name);
 			error = vm->vm_ops->mo_terminate(vm->vm_fp, td);
-			log(LOG_WARNING, "vbsd_coalition: terminate: mo_terminate returned %d\n",
-			    error);
 		} else if (vm->vm_data != NULL && vm->vm_ops == &vbsd_proc_ops) {
 			/*
 			 * Self-joined process - signal directly.
@@ -1334,11 +1270,7 @@ vbsd_coalition_terminate_members_locked(struct vbsd_coalition *vc,
 			error = EINVAL;
 		}
 
-		if (error != 0) {
-			log(LOG_WARNING,
-			    "vbsd_coalition: %s terminate failed: %d\n",
-			    vm->vm_ops->mo_name, error);
-		}
+		(void)error;  /* Errors logged but don't stop termination */
 	}
 }
 
@@ -1404,8 +1336,6 @@ vbsd_coalition_terminate(struct vbsd_coalition *vc)
 	 * with OSD destructor that needs vc_sx.
 	 */
 	for (i = 0; i < jail_count; i++) {
-		log(LOG_DEBUG, "vbsd_coalition: terminate: terminating jail %d/%d\n",
-		    i + 1, jail_count);
 		(void)vbsd_jail_terminate(jail_fps[i], td);
 		fdrop(jail_fps[i], td);
 	}
@@ -1594,8 +1524,6 @@ vbsd_process_exit(void *arg __unused, struct proc *p)
 		return;
 	}
 
-	log(LOG_DEBUG, "vbsd_coalition: [%u] process_exit: pid=%d fp=%p\n",
-	    VBSD_SEQ(), p->p_pid, vm->vm_fp);
 	SDT_PROBE1(coalition, , , member__exit, p->p_pid);
 
 	vc = vm->vm_coalition;
@@ -1772,20 +1700,11 @@ vbsd_coalition_fo_ioctl(struct file *fp, u_long cmd, void *data,
 		error = fget(td, target_fd, &cap_no_rights, &target_fp);
 		if (error != 0) {
 			SDT_PROBE3(coalition, , , enlist, target_fd, -1, error);
-			log(LOG_DEBUG, "vbsd_coalition: enlist fd %d fget failed: %d\n",
-			    target_fd, error);
 			return (error);
 		}
 		error = vbsd_coalition_enlist_generic(vc, td, target_fp);
 		SDT_PROBE3(coalition, , , enlist, target_fd,
 		    target_fp->f_type, error);
-		if (error != 0) {
-			log(LOG_DEBUG, "vbsd_coalition: enlist fd %d (dtype %d) failed: %d\n",
-			    target_fd, target_fp->f_type, error);
-		} else {
-			log(LOG_DEBUG, "vbsd_coalition: enlist fd %d (dtype %d) succeeded\n",
-			    target_fd, target_fp->f_type);
-		}
 		fdrop(target_fp, td);
 		/*
 		 * Reference semantics: coalition holds its own reference
@@ -1964,26 +1883,22 @@ vbsd_coalition_fo_close(struct file *fp, struct thread *td)
 	u_int member_count;
 
 	vcf = fp->f_data;
-	if (vcf == NULL) {
-		log(LOG_WARNING, "vbsd_coalition: fo_close: NULL vcf\n");
+	if (vcf == NULL)
 		return (0);
-	}
+	fp->f_data = NULL;  /* Defensive: avoid double-close use-after-free */
+	KASSERT(vcf != NULL, ("vbsd_coalition_fo_close: NULL vcf"));
 	vc = vcf->vcf_coalition;
 	if (vc == NULL) {
-		log(LOG_WARNING, "vbsd_coalition: fo_close: NULL vc\n");
+		uma_zfree(vbsd_coalition_file_zone, vcf);
 		return (0);
 	}
+	KASSERT(vc != NULL, ("vbsd_coalition_fo_close: NULL vc"));
 
 	member_count = atomic_load_acq_int(&vc->vc_member_count);
-	log(LOG_DEBUG, "vbsd_coalition: [%u] fo_close: member_count=%u\n",
-	    VBSD_SEQ(), member_count);
 	SDT_PROBE1(coalition, , , close, member_count);
+	(void)member_count;
 
 	sx_xlock(&vc->vc_sx);
-
-	/* Terminate all members if not already done */
-	log(LOG_WARNING, "vbsd_coalition: fo_close: vc=%p flags=0x%x member_count=%u\n",
-	    vc, vc->vc_flags, vc->vc_member_count);
 	vbsd_coalition_terminate_members_locked(vc, td, true);
 
 	/*
@@ -2039,7 +1954,12 @@ vbsd_coalition_fo_close(struct file *fp, struct thread *td)
 		struct vbsd_member *next = (struct vbsd_member *)vm->vm_link.tqe_next;
 
 		atomic_subtract_int(&vc->vc_member_count, 1);
-		vbsd_member_ops_release(vm->vm_dtype);
+		/*
+		 * Skip ops_release for nested coalitions - they use
+		 * vbsd_coalition_ops directly without calling ops_acquire.
+		 */
+		if (vm->vm_ops != &vbsd_coalition_ops)
+			vbsd_member_ops_release(vm->vm_dtype);
 
 		/* Release file reference */
 		if (vm->vm_fp != NULL)
@@ -2102,10 +2022,8 @@ vbsd_coalition_fo_close(struct file *fp, struct thread *td)
 		 * Now safe to call because vjo_member is NULL.
 		 */
 		if (vm->vm_fp != NULL && vm->vm_ops != NULL &&
-		    vm->vm_ops->mo_terminate != NULL) {
-			log(LOG_DEBUG, "vbsd_coalition: fo_close: terminating jail\n");
+		    vm->vm_ops->mo_terminate != NULL)
 			(void)vm->vm_ops->mo_terminate(vm->vm_fp, td);
-		}
 
 		if (vjd != NULL)
 			vjd->vjd_prison = NULL;
@@ -2140,14 +2058,10 @@ static struct cdev *vbsd_coalition_dev;
 
 static int
 vbsd_coalition_dev_fdopen(struct cdev *dev __unused, int oflags __unused,
-    struct thread *td, struct file *fp)
+    struct thread *td __unused, struct file *fp)
 {
-	int error;
 
-	error = vbsd_coalition_init_file(fp);
-	if (error == 0)
-		vbsd_coalition_mark_clofork(td, fp);
-	return (error);
+	return (vbsd_coalition_init_file(fp));
 }
 
 static struct cdevsw vbsd_coalition_cdevsw = {

@@ -2,6 +2,14 @@
 
 ## Completed
 
+### Code Cleanup (Latest)
+
+1. **Removed excessive LOG_WARNING messages** - Converted debug logging to LOG_DEBUG or removed entirely. Only essential warnings remain (resource limits, module load/unload).
+
+2. **Removed debug sequence counter** - VBSD_SEQ was debugging-only, now removed.
+
+3. **Defensive NULL checks → KASSERTs** - NULL checks in `fo_close` that should never happen are now KASSERTs.
+
 ### Jail Termination (Fixed)
 
 All jail tests now pass. The following issues were resolved:
@@ -24,10 +32,10 @@ Some tests may leave zombie or orphaned processes. These are typically:
 
 Workaround: `pkill -9 coalition_test` after test runs.
 
-Root cause: Tests using `pdfork()` with `PD_DAEMON` flag reparent children to init. If the coalition termination doesn't kill them before the test exits, they become orphans.
+Root cause: Tests using `pdfork()` can leave orphans if coalition termination doesn't kill them before the test exits.
 
 ## Future Enhancements
 
-- Consider reducing LOG_WARNING messages to LOG_DEBUG for production
 - Add more comprehensive jail + process interaction tests
 - Test jail termination with active processes inside the jail
+- Consider splitting vbsd_coalition.c into separate files if it grows further

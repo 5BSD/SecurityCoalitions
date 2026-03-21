@@ -23,6 +23,7 @@
 
 #include <errno.h>
 #include <fcntl.h>
+#include <poll.h>
 #include <signal.h>
 #include <stdio.h>
 #include <stdlib.h>
@@ -40,6 +41,55 @@ clear_clofork(int fd)
 	flags = fcntl(fd, F_GETFD);
 	if (flags >= 0)
 		(void)fcntl(fd, F_SETFD, flags & ~FD_CLOFORK);
+}
+
+static int
+waitpid_timeout(pid_t pid, int *status, int timeout_ms)
+{
+	const int step_ms = 25;
+	int elapsed = 0;
+	pid_t ret;
+
+	while (elapsed < timeout_ms) {
+		ret = waitpid(pid, status, WNOHANG);
+		if (ret == pid)
+			return (0);
+		if (ret < 0)
+			return (-1);
+		usleep(step_ms * 1000);
+		elapsed += step_ms;
+	}
+	errno = ETIMEDOUT;
+	return (1);
+}
+
+static int
+read_ready_byte(int fd, char *out, int timeout_ms)
+{
+	struct pollfd pfd;
+	int ret;
+
+	pfd.fd = fd;
+	pfd.events = POLLIN;
+	ret = poll(&pfd, 1, timeout_ms);
+	if (ret <= 0)
+		return (ret);
+	return (read(fd, out, 1) == 1) ? 1 : -1;
+}
+
+/*
+ * Unique jail name generation to prevent collisions between test runs.
+ * Each test run uses the test process PID as a suffix.
+ */
+static pid_t jail_name_pid;
+
+static const char *
+jail_name(const char *base)
+{
+	static char namebuf[64];
+
+	snprintf(namebuf, sizeof(namebuf), "%s_%d", base, (int)jail_name_pid);
+	return (namebuf);
 }
 
 /*
@@ -126,16 +176,8 @@ get_jail_desc(const char *name)
 	iov[3].iov_len = sizeof(jail_fd);
 
 	ret = jail_get(iov, 4, JAIL_GET_DESC);
-	if (ret < 0) {
-		fprintf(stderr, "DEBUG: get_jail_desc(%s) jail_get failed: %s (errno=%d)\n",
-		    name, strerror(errno), errno);
+	if (ret < 0 || jail_fd < 0)
 		return (-1);
-	}
-	if (jail_fd < 0) {
-		fprintf(stderr, "DEBUG: get_jail_desc(%s) jail_fd is -1 (ret=%d)\n",
-		    name, ret);
-		return (-1);
-	}
 	return (jail_fd);
 }
 
@@ -161,10 +203,6 @@ get_jail_id(const char *name)
 	iov[1].iov_len = strlen(namebuf) + 1;
 
 	jid = jail_get(iov, 2, 0);
-	if (jid < 0) {
-		fprintf(stderr, "DEBUG: get_jail_id(%s) failed: %s (errno=%d)\n",
-		    name, strerror(errno), errno);
-	}
 	return (jid);
 }
 
@@ -397,6 +435,7 @@ test_enlist_process_twice_fails(void)
 	}
 
 	if (pid == 0) {
+		close(coal_fd);	/* Don't hold coalition fd */
 		pause();	/* Wait indefinitely for signal */
 		_exit(0);
 	}
@@ -633,6 +672,7 @@ test_terminate_signals_members(void)
 		return TEST_FAIL("pdfork 1 failed");
 	}
 	if (pid1 == 0) {
+		close(coal_fd);	/* Don't hold coalition fd */
 		pause();	/* Wait indefinitely for signal */
 		_exit(0);
 	}
@@ -646,6 +686,7 @@ test_terminate_signals_members(void)
 		return TEST_FAIL("pdfork 2 failed");
 	}
 	if (pid2 == 0) {
+		close(coal_fd);	/* Don't hold coalition fd */
 		pause();	/* Wait indefinitely for signal */
 		_exit(0);
 	}
@@ -827,7 +868,7 @@ test_enlist_jail(void)
 	TEST_ASSERT(coal_fd >= 0, "Failed to create coalition");
 
 	/* Create a test jail with owning descriptor */
-	jail_fd = create_test_jail("coalition_test_jail1");
+	jail_fd = create_test_jail(jail_name("jail1"));
 	if (jail_fd < 0) {
 		close(coal_fd);
 		return TEST_FAIL("Failed to create test jail");
@@ -843,7 +884,8 @@ test_enlist_jail(void)
 		return TEST_FAIL("Failed to enlist jail");
 	}
 
-	/* jail_fd is closed after enlist. Coalition owns the jail now. */
+	/* Caller keeps fd with reference semantics - must close when done */
+	close(jail_fd);
 	close(coal_fd);
 
 	return TEST_PASS(NULL);
@@ -864,7 +906,7 @@ test_enlist_jail_twice_fails(void)
 	coal_fd = create_coalition();
 	TEST_ASSERT(coal_fd >= 0, "Failed to create coalition");
 
-	jail_fd = create_test_jail("coalition_test_jail2");
+	jail_fd = create_test_jail(jail_name("jail2"));
 	if (jail_fd < 0) {
 		close(coal_fd);
 		return TEST_FAIL("Failed to create test jail");
@@ -875,7 +917,7 @@ test_enlist_jail_twice_fails(void)
 	    "First jail enlistment failed");
 
 	/* Get another descriptor to the same jail */
-	jail_fd2 = get_jail_desc("coalition_test_jail2");
+	jail_fd2 = get_jail_desc(jail_name("jail2"));
 	if (jail_fd2 < 0) {
 		close(jail_fd);
 		close(coal_fd);
@@ -911,7 +953,7 @@ test_enlist_jail_different_coalition(void)
 	coal_fd2 = create_coalition();
 	TEST_ASSERT(coal_fd2 >= 0, "Failed to create second coalition");
 
-	jail_fd = create_test_jail("coalition_test_jail3");
+	jail_fd = create_test_jail(jail_name("jail3"));
 	if (jail_fd < 0) {
 		close(coal_fd2);
 		close(coal_fd1);
@@ -922,7 +964,8 @@ test_enlist_jail_different_coalition(void)
 	TEST_ASSERT(ioctl(coal_fd1, VBSD_COALITION_ENLIST, &jail_fd) == 0,
 	    "Failed to enlist jail in first coalition");
 
-	/* jail_fd kept by caller (reference semantics), coal_fd1 owns the jail now */
+	/* Caller keeps fd with reference semantics - must close when done */
+	close(jail_fd);
 	close(coal_fd2);
 	close(coal_fd1);
 
@@ -955,14 +998,14 @@ test_jail_fork_inheritance(void)
 	TEST_ASSERT(coal_fd >= 0, "Failed to create coalition");
 
 	/* Create a test jail (non-owning so we control lifetime) */
-	jail_fd = create_test_jail("coalition_test_jail_fork");
+	jail_fd = create_test_jail(jail_name("jail_fork"));
 	if (jail_fd < 0) {
 		close(coal_fd);
 		return TEST_FAIL("Failed to create test jail");
 	}
 
 	/* Get the jail ID for jail_attach */
-	jid = get_jail_id("coalition_test_jail_fork");
+	jid = get_jail_id(jail_name("jail_fork"));
 	if (jid < 0) {
 		close(jail_fd);
 		close(coal_fd);
@@ -978,6 +1021,7 @@ test_jail_fork_inheritance(void)
 	/* jail_fd still valid (reference semantics) */
 
 	if (pipe(pipefd) < 0) {
+		close(jail_fd);
 		close(coal_fd);
 		return TEST_FAIL("pipe failed");
 	}
@@ -986,6 +1030,7 @@ test_jail_fork_inheritance(void)
 	if (pid < 0) {
 		close(pipefd[0]);
 		close(pipefd[1]);
+		close(jail_fd);
 		close(coal_fd);
 		return TEST_FAIL("fork failed");
 	}
@@ -1032,7 +1077,7 @@ test_jail_fork_inheritance(void)
 	if (read(pipefd[0], &buf, 1) != 1 || buf != 'R') {
 		close(pipefd[0]);
 		waitpid(pid, NULL, 0);
-		/* jail_fd enlisted in coalition, caller keeps fd, don't close */
+		close(jail_fd);
 		close(coal_fd);
 		if (buf == 'A')
 			return TEST_FAIL("Child failed to attach to jail");
@@ -1048,7 +1093,7 @@ test_jail_fork_inheritance(void)
 	 */
 	if (ioctl(coal_fd, VBSD_COALITION_TERMINATE) < 0) {
 		waitpid(pid, NULL, 0);
-		/* jail_fd enlisted in coalition, caller keeps fd, don't close */
+		close(jail_fd);
 		close(coal_fd);
 		return TEST_FAIL("Terminate failed");
 	}
@@ -1058,7 +1103,7 @@ test_jail_fork_inheritance(void)
 
 	/* Clean up */
 	waitpid(pid, NULL, 0);
-	/* jail_fd enlisted in coalition, caller keeps fd on successful enlist, don't close */
+	close(jail_fd);
 	close(coal_fd);
 
 	return TEST_PASS(NULL);
@@ -1080,14 +1125,14 @@ test_terminate_removes_jails(void)
 	TEST_ASSERT(coal_fd >= 0, "Failed to create coalition");
 
 	/* Create a persistent jail (will not be auto-removed on fd close) */
-	jail_fd = create_test_jail("coalition_test_jail_term");
+	jail_fd = create_test_jail(jail_name("jail_term"));
 	if (jail_fd < 0) {
 		close(coal_fd);
 		return TEST_FAIL("Failed to create test jail");
 	}
 
 	/* Get the jail ID to check existence later */
-	jid = get_jail_id("coalition_test_jail_term");
+	jid = get_jail_id(jail_name("jail_term"));
 	TEST_ASSERT(jid > 0, "Failed to get jail ID before enlistment");
 
 	/* Enlist the jail - jail_caller keeps fd (reference semantics) */
@@ -1109,10 +1154,11 @@ test_terminate_removes_jails(void)
 	usleep(100000);  /* 100ms */
 
 	/* Check if the jail still exists - it should be gone or dying */
-	jid = get_jail_id("coalition_test_jail_term");
+	jid = get_jail_id(jail_name("jail_term"));
 	/* get_jail_id returns -1 if jail doesn't exist */
 	TEST_ASSERT(jid < 0, "Jail should be removed after coalition terminate");
 
+	close(jail_fd);
 	close(coal_fd);
 
 	return TEST_PASS(NULL);
@@ -1132,13 +1178,13 @@ test_enlist_multiple_jails(void)
 	coal_fd = create_coalition();
 	TEST_ASSERT(coal_fd >= 0, "Failed to create coalition");
 
-	jail_fd1 = create_test_jail("coalition_test_jail_multi1");
+	jail_fd1 = create_test_jail(jail_name("jail_multi1"));
 	if (jail_fd1 < 0) {
 		close(coal_fd);
 		return TEST_FAIL("Failed to create first test jail");
 	}
 
-	jail_fd2 = create_test_jail("coalition_test_jail_multi2");
+	jail_fd2 = create_test_jail(jail_name("jail_multi2"));
 	if (jail_fd2 < 0) {
 		close(jail_fd1);
 		close(coal_fd);
@@ -1151,7 +1197,9 @@ test_enlist_multiple_jails(void)
 	TEST_ASSERT(ioctl(coal_fd, VBSD_COALITION_ENLIST, &jail_fd2) == 0,
 	    "Failed to enlist second jail");
 
-	/* jail_fd1 and jail_fd2 kept by caller (reference semantics) */
+	/* Caller keeps fds with reference semantics - must close when done */
+	close(jail_fd1);
+	close(jail_fd2);
 	close(coal_fd);
 
 	return TEST_PASS(NULL);
@@ -1177,7 +1225,7 @@ test_enlist_jail_after_terminate_fails(void)
 	    "Terminate failed");
 
 	/* Now create a jail and try to enlist it */
-	jail_fd = create_test_jail("coalition_test_jail_post");
+	jail_fd = create_test_jail(jail_name("jail_post"));
 	if (jail_fd < 0) {
 		close(coal_fd);
 		return TEST_FAIL("Failed to create test jail");
@@ -1235,7 +1283,8 @@ test_socket_shutdown_on_terminate(void)
 	TEST_ASSERT(n == 0 || (n < 0 && errno == ECONNRESET),
 	    "Socket should be shutdown (expected EOF or ECONNRESET)");
 
-	/* sv[0] kept by caller (reference semantics), just close sv[1] and coalition */
+	/* Close both sockets and coalition */
+	close(sv[0]);
 	close(sv[1]);
 	close(coal_fd);
 
@@ -1295,7 +1344,8 @@ test_shm_truncate_on_terminate(void)
 		TEST_ASSERT(sb.st_size == 0, "SHM should be truncated to 0");
 		close(shm_fd2);
 	}
-	/* Note: shm_fd may already be dropped by coalition */
+	/* Close our shm_fd (coalition has its own reference) */
+	close(shm_fd);
 
 	shm_unlink(shm_name);
 	close(coal_fd);
@@ -1329,6 +1379,9 @@ test_enlist_device(void)
 	TEST_ASSERT(ioctl(coal_fd, VBSD_COALITION_ENLIST, &dev_fd) == 0,
 	    "Enlist device failed (DTYPE_DEV not supported?)");
 
+	/* Close our dev_fd (coalition has its own reference) */
+	close(dev_fd);
+
 	/* Close coalition - should cleanly handle the device */
 	close(coal_fd);
 
@@ -1346,33 +1399,50 @@ static struct test_result
 test_enlist_set_basic(void)
 {
 	int coal_fd;
-	int proc_fds[3];
-	pid_t pids[3];
+	int proc_fds[3] = { -1, -1, -1 };
+	pid_t pids[3] = { -1, -1, -1 };
 	struct vbsd_enlist_set es;
+	int sync_pipe[2] = { -1, -1 };
+	char buf;
 	int i;
+	int status;
+	const char *fail_msg = NULL;
+	static char fail_detail[160];
 
 	coal_fd = create_coalition();
 	TEST_ASSERT(coal_fd >= 0, "Failed to create coalition");
+
+	/* Pipe for children to signal readiness */
+	TEST_ASSERT(pipe(sync_pipe) == 0, "pipe failed");
 
 	/* Create 3 child processes */
 	for (i = 0; i < 3; i++) {
 		pids[i] = pdfork(&proc_fds[i], 0);
 		if (pids[i] < 0) {
 			/* Cleanup on failure */
-			while (--i >= 0) {
-				pdkill(proc_fds[i], SIGKILL);
-				close(proc_fds[i]);
-				waitpid(pids[i], NULL, 0);
-			}
-			close(coal_fd);
-			return TEST_FAIL("pdfork failed");
+			fail_msg = "pdfork failed";
+			goto cleanup_fail;
 		}
 		if (pids[i] == 0) {
-			close(coal_fd);	/* Don't hold coalition fd */
+			close(coal_fd);		/* Close if inherited */
+			close(sync_pipe[0]);	/* Close read end */
+			(void)write(sync_pipe[1], "r", 1);	/* Signal ready */
+			close(sync_pipe[1]);
 			pause();	/* Wait indefinitely for signal */
 			_exit(0);
 		}
 	}
+
+	/* Wait for all children to signal readiness */
+	close(sync_pipe[1]);
+	for (i = 0; i < 3; i++) {
+		if (read_ready_byte(sync_pipe[0], &buf, 2000) != 1) {
+			fail_msg = "Timeout waiting for child readiness";
+			goto cleanup_fail;
+		}
+	}
+	close(sync_pipe[0]);
+	sync_pipe[0] = -1;
 
 	/* Batch enlist all 3 - caller keeps fds (reference semantics) */
 	es.fds = proc_fds;
@@ -1385,16 +1455,52 @@ test_enlist_set_basic(void)
 
 	/* Close coalition - all processes should be signaled */
 	close(coal_fd);
+	coal_fd = -1;
 
 	/* Verify all children were signaled */
 	for (i = 0; i < 3; i++) {
-		int status;
-		waitpid(pids[i], &status, 0);
-		TEST_ASSERT(WIFSIGNALED(status), "Process not signaled");
+		if (waitpid_timeout(pids[i], &status, 5000) != 0) {
+			int kerr = 0;
+			int alive = 0;
+
+			if (kill(pids[i], 0) == 0)
+				alive = 1;
+			else
+				kerr = errno;
+			snprintf(fail_detail, sizeof(fail_detail),
+			    "Timeout waiting for child %d (pid %d) exit (alive=%s errno=%d)",
+			    i, (int)pids[i], alive ? "yes" : "no", kerr);
+			fail_msg = fail_detail;
+			goto cleanup_fail;
+		}
+		if (!WIFSIGNALED(status)) {
+			fail_msg = "Process not signaled";
+			goto cleanup_fail;
+		}
 		close(proc_fds[i]);
+		proc_fds[i] = -1;
 	}
 
 	return TEST_PASS(NULL);
+
+cleanup_fail:
+	for (i = 0; i < 3; i++) {
+		if (proc_fds[i] >= 0)
+			(void)pdkill(proc_fds[i], SIGKILL);
+	}
+	for (i = 0; i < 3; i++) {
+		if (pids[i] > 0)
+			(void)waitpid_timeout(pids[i], &status, 1000);
+		if (proc_fds[i] >= 0)
+			close(proc_fds[i]);
+	}
+	if (sync_pipe[0] >= 0)
+		close(sync_pipe[0]);
+	if (sync_pipe[1] >= 0)
+		close(sync_pipe[1]);
+	if (coal_fd >= 0)
+		close(coal_fd);
+	return TEST_FAIL(fail_msg);
 }
 
 /*
@@ -1431,10 +1537,14 @@ test_enlist_set_partial_failure(void)
 	int fds[3];
 	pid_t pids[2];
 	struct vbsd_enlist_set es;
+	int sync_pipe[2];
+	char buf;
 	int ret;
 
 	coal_fd = create_coalition();
 	TEST_ASSERT(coal_fd >= 0, "Failed to create coalition");
+
+	TEST_ASSERT(pipe(sync_pipe) == 0, "pipe failed");
 
 	/* Create 2 valid processes */
 	for (int i = 0; i < 2; i++) {
@@ -1445,15 +1555,26 @@ test_enlist_set_partial_failure(void)
 				close(fds[0]);
 				waitpid(pids[0], NULL, 0);
 			}
+			close(sync_pipe[0]);
+			close(sync_pipe[1]);
 			close(coal_fd);
 			return TEST_FAIL("pdfork failed");
 		}
 		if (pids[i] == 0) {
-			close(coal_fd);	/* Don't hold coalition fd */
-			pause();	/* Wait indefinitely for signal */
+			close(coal_fd);
+			close(sync_pipe[0]);
+			(void)write(sync_pipe[1], "r", 1);
+			close(sync_pipe[1]);
+			pause();
 			_exit(0);
 		}
 	}
+
+	/* Wait for children to be ready */
+	close(sync_pipe[1]);
+	for (int i = 0; i < 2; i++)
+		(void)read(sync_pipe[0], &buf, 1);
+	close(sync_pipe[0]);
 
 	/* Third fd is invalid */
 	fds[2] = 9999;
@@ -1520,23 +1641,31 @@ test_enlist_set_exceeds_max(void)
 static struct test_result
 test_enlist_set_mixed_types(void)
 {
-	int coal_fd;
-	int fds[4];
-	int pipefd[2];
-	int sv[2];
+	int coal_fd = -1;
+	int fds[4] = { -1, -1, -1, -1 };
+	int pipefd[2] = { -1, -1 };
+	int sv[2] = { -1, -1 };
 	struct vbsd_enlist_set es;
+	const char *fail_msg = NULL;
+	static char msg[160];
+	int ret;
 
 	coal_fd = create_coalition();
 	TEST_ASSERT(coal_fd >= 0, "Failed to create coalition");
 
 	/* Create a pipe */
-	TEST_ASSERT(pipe(pipefd) == 0, "pipe failed");
+	if (pipe(pipefd) != 0) {
+		fail_msg = "pipe failed";
+		goto cleanup_fail;
+	}
 	fds[0] = pipefd[0];
 	fds[1] = pipefd[1];
 
 	/* Create a socket pair */
-	TEST_ASSERT(socketpair(AF_UNIX, SOCK_STREAM, 0, sv) == 0,
-	    "socketpair failed");
+	if (socketpair(AF_UNIX, SOCK_STREAM, 0, sv) != 0) {
+		fail_msg = "socketpair failed";
+		goto cleanup_fail;
+	}
 	fds[2] = sv[0];
 	fds[3] = sv[1];
 
@@ -1545,14 +1674,40 @@ test_enlist_set_mixed_types(void)
 	es.count = 4;
 	es.enlisted = 0;
 
-	TEST_ASSERT(ioctl(coal_fd, VBSD_COALITION_ENLIST_SET, &es) == 0,
-	    "Batch enlist mixed types failed");
-	TEST_ASSERT(es.enlisted == 4, "Expected 4 enlisted");
+	ret = ioctl(coal_fd, VBSD_COALITION_ENLIST_SET, &es);
+	if (ret != 0) {
+		int err = errno;
+		snprintf(msg, sizeof(msg),
+		    "Batch enlist failed (enlisted=%u, errno=%d: %s)",
+		    es.enlisted, err, strerror(err));
+		fail_msg = msg;
+		goto cleanup_fail;
+	}
+	if (es.enlisted != 4) {
+		snprintf(msg, sizeof(msg),
+		    "Expected 4 enlisted, got %u", es.enlisted);
+		fail_msg = msg;
+		goto cleanup_fail;
+	}
 
 	/* Caller keeps fds, close coalition */
 	close(coal_fd);
+	coal_fd = -1;
+	for (int i = 0; i < 4; i++) {
+		if (fds[i] >= 0)
+			close(fds[i]);
+	}
 
 	return TEST_PASS(NULL);
+
+cleanup_fail:
+	if (coal_fd >= 0)
+		close(coal_fd);
+	for (int i = 0; i < 4; i++) {
+		if (fds[i] >= 0)
+			close(fds[i]);
+	}
+	return TEST_FAIL(fail_msg);
 }
 
 /* =========================================================================
@@ -1847,6 +2002,7 @@ test_self_join_when_already_enlisted(void)
 	TEST_ASSERT(status == 0,
 	    "Self-join when already enlisted should fail with EBUSY");
 
+	close(proc_fd);
 	close(coal_fd);
 	return TEST_PASS(NULL);
 }
@@ -1875,6 +2031,7 @@ test_use_after_close(void)
 	}
 
 	if (pid == 0) {
+		close(coal_fd);	/* Don't hold coalition fd */
 		pause();	/* Wait indefinitely for signal */
 		_exit(0);
 	}
@@ -1924,6 +2081,7 @@ test_enlist_after_terminate_fails(void)
 	}
 
 	if (pid == 0) {
+		close(coal_fd);	/* Don't hold coalition fd */
 		pause();	/* Wait indefinitely for signal */
 		_exit(0);
 	}
@@ -1959,18 +2117,22 @@ test_enlist_jail_via_different_desc(void)
 	coal_fd = create_coalition();
 	TEST_ASSERT(coal_fd >= 0, "Failed to create coalition");
 
-	jail_fd1 = create_test_jail("coalition_test_jail_dup");
+	jail_fd1 = create_test_jail(jail_name("jail_dup"));
 	if (jail_fd1 < 0) {
 		close(coal_fd);
 		return TEST_FAIL("Failed to create test jail");
 	}
 
 	/* Get another descriptor to same jail */
-	jail_fd2 = get_jail_desc("coalition_test_jail_dup");
+	jail_fd2 = get_jail_desc(jail_name("jail_dup"));
 	if (jail_fd2 < 0) {
+		static char msg[128];
+		int err = errno;
+		snprintf(msg, sizeof(msg),
+		    "Failed to get second jaildesc: %s", strerror(err));
 		close(jail_fd1);
 		close(coal_fd);
-		return TEST_FAIL("Failed to get second jaildesc");
+		return TEST_FAIL(msg);
 	}
 
 	/* First enlist succeeds - caller keeps jail_fd1 */
@@ -1983,6 +2145,7 @@ test_enlist_jail_via_different_desc(void)
 	    "Enlist same jail via different desc should fail with EBUSY");
 
 	close(jail_fd2);
+	close(jail_fd1);
 	close(coal_fd);
 	return TEST_PASS(NULL);
 }
@@ -2293,6 +2456,7 @@ test_dup_before_enlist(void)
 	}
 
 	if (pid == 0) {
+		close(coal_fd);	/* Don't hold coalition fd */
 		pause();	/* Wait indefinitely for signal */
 		_exit(0);
 	}
@@ -2305,13 +2469,14 @@ test_dup_before_enlist(void)
 	TEST_ASSERT(ioctl(coal_fd, VBSD_COALITION_ENLIST, &proc_fd) == 0,
 	    "Enlist failed");
 
-	/* Original fd is now closed, but dup still refers to same process */
+	/* Both fds still valid (reference semantics), dup refers to same process */
 	/* Trying to enlist dup should fail - process already enlisted */
 	ret = ioctl(coal_fd, VBSD_COALITION_ENLIST, &proc_fd_dup);
 	TEST_ASSERT(ret < 0 && errno == EBUSY,
 	    "Enlist via dup of already-enlisted process should fail with EBUSY");
 
 	close(proc_fd_dup);
+	close(proc_fd);
 	close(coal_fd);
 	usleep(10000);	/* PD_DAEMON procdesc handles reaping */
 	return TEST_PASS(NULL);
@@ -2434,6 +2599,7 @@ test_fd_passing_both_close(void)
 	TEST_ASSERT(WIFSIGNALED(proc_status),
 	    "Process should be killed when coalition closes");
 
+	close(proc_fd);
 	return TEST_PASS(NULL);
 }
 
@@ -2608,6 +2774,7 @@ test_process_exit_removes_member(void)
 
 	if (pid == 0) {
 		/* Child: exit after brief delay */
+		close(coal_fd);	/* Don't hold coalition fd */
 		usleep(1000);
 		_exit(42);
 	}
@@ -2656,6 +2823,7 @@ test_enlist_dead_process(void)
 
 	if (pid == 0) {
 		/* Child: exit immediately */
+		close(coal_fd);	/* Don't hold coalition fd */
 		_exit(0);
 	}
 
@@ -2794,6 +2962,7 @@ test_stat_with_members(void)
 	TEST_ASSERT(st.vcs_member_count == 1, "Should have 1 member");
 	TEST_ASSERT(st.vcs_process_count == 1, "Should have 1 process member");
 
+	close(proc_fd);
 	close(coal_fd);
 	usleep(10000);	/* PD_DAEMON procdesc handles reaping */
 	return TEST_PASS(NULL);
@@ -3019,15 +3188,34 @@ test_graceful_stubborn_process(void)
 	read(pipefd[0], &buf, 1);
 	close(pipefd[0]);
 
-	TEST_ASSERT(ioctl(coal_fd, VBSD_COALITION_ENLIST, &proc_fd) == 0,
-	    "Enlist failed");
+	if (ioctl(coal_fd, VBSD_COALITION_ENLIST, &proc_fd) != 0) {
+		static char msg[128];
+		int err = errno;
+		snprintf(msg, sizeof(msg), "Enlist failed: %s (errno=%d)",
+		    strerror(err), err);
+		pdkill(proc_fd, SIGKILL);
+		close(proc_fd);
+		waitpid(pid, NULL, 0);
+		close(coal_fd);
+		return TEST_FAIL(msg);
+	}
 
 	/* Graceful terminate - SIGTERM ignored, should SIGKILL after timeout */
-	TEST_ASSERT(ioctl(coal_fd, VBSD_COALITION_TERMINATE_GRACEFUL, &g) == 0,
-	    "Graceful terminate failed");
+	if (ioctl(coal_fd, VBSD_COALITION_TERMINATE_GRACEFUL, &g) != 0) {
+		static char msg[128];
+		int err = errno;
+		snprintf(msg, sizeof(msg), "Graceful terminate failed: %s (errno=%d)",
+		    strerror(err), err);
+		pdkill(proc_fd, SIGKILL);
+		close(proc_fd);
+		waitpid(pid, NULL, 0);
+		close(coal_fd);
+		return TEST_FAIL(msg);
+	}
 
 	/* Process should have been killed by SIGKILL after timeout */
 	waitpid(pid, &status, 0);
+	close(proc_fd);
 	if (!WIFSIGNALED(status)) {
 		static char msg[128];
 		snprintf(msg, sizeof(msg),
@@ -3119,6 +3307,8 @@ test_nested_coalition_basic(void)
 	    "STAT outer failed");
 	TEST_ASSERT(st.vcs_nested_count == 1, "Outer should have 1 nested coalition");
 
+	close(proc_fd);
+	close(inner_fd);
 	close(outer_fd);
 	waitpid(pid, NULL, 0);
 	return TEST_PASS(NULL);
@@ -3170,6 +3360,8 @@ test_nested_coalition_cascade_terminate(void)
 	TEST_ASSERT(WIFSIGNALED(status) && WTERMSIG(status) == SIGKILL,
 	    "Process should be killed via cascade");
 
+	close(proc_fd);
+	close(inner_fd);
 	close(outer_fd);
 	return TEST_PASS(NULL);
 }
@@ -3193,17 +3385,37 @@ test_nested_coalition_depth(void)
 	TEST_ASSERT(level2_fd >= 0, "Failed to create level 2");
 
 	/* Nest: level0 -> level1 -> level2 */
-	TEST_ASSERT(ioctl(level1_fd, VBSD_COALITION_ENLIST, &level2_fd) == 0,
-	    "Enlist level2 in level1 failed");
+	if (ioctl(level1_fd, VBSD_COALITION_ENLIST, &level2_fd) != 0) {
+		static char msg[128];
+		int err = errno;
+		snprintf(msg, sizeof(msg),
+		    "Enlist level2 in level1 failed (errno=%d: %s)",
+		    err, strerror(err));
+		close(level2_fd);
+		close(level1_fd);
+		close(level0_fd);
+		return TEST_FAIL(msg);
+	}
 
-	TEST_ASSERT(ioctl(level0_fd, VBSD_COALITION_ENLIST, &level1_fd) == 0,
-	    "Enlist level1 in level0 failed");
+	if (ioctl(level0_fd, VBSD_COALITION_ENLIST, &level1_fd) != 0) {
+		static char msg[128];
+		int err = errno;
+		snprintf(msg, sizeof(msg),
+		    "Enlist level1 in level0 failed (errno=%d: %s)",
+		    err, strerror(err));
+		close(level2_fd);
+		close(level1_fd);
+		close(level0_fd);
+		return TEST_FAIL(msg);
+	}
 
 	/* Check depth via stat - level0 should still be depth 0 */
 	TEST_ASSERT(ioctl(level0_fd, VBSD_COALITION_STAT, &st) == 0,
 	    "STAT level0 failed");
 	TEST_ASSERT(st.vcs_nesting_depth == 0, "Level0 should have depth 0");
 
+	close(level2_fd);
+	close(level1_fd);
 	close(level0_fd);
 	return TEST_PASS(NULL);
 }
@@ -3252,12 +3464,15 @@ test_nested_coalition_depth_limit(void)
 	/* Nest them: fds[0] -> fds[1] -> fds[2] -> ... */
 	for (i = VBSD_MAX_NESTING_DEPTH; i > 0; i--) {
 		ret = ioctl(fds[i-1], VBSD_COALITION_ENLIST, &fds[i]);
-		if (i > VBSD_MAX_NESTING_DEPTH - 1) {
-			/* Should succeed up to the limit */
-			if (ret != 0) {
-				close(fds[0]);
-				return TEST_FAIL("Nesting should succeed before limit");
-			}
+		if (ret != 0) {
+			static char msg[128];
+			int err = errno;
+			snprintf(msg, sizeof(msg),
+			    "Enlist fds[%d] in fds[%d] failed (errno=%d: %s)",
+			    i, i-1, err, strerror(err));
+			for (int j = 0; j <= VBSD_MAX_NESTING_DEPTH; j++)
+				close(fds[j]);
+			return TEST_FAIL(msg);
 		}
 	}
 
@@ -3283,6 +3498,7 @@ test_nested_coalition_depth_limit(void)
 int
 main(int argc __unused, char *argv[] __unused)
 {
+	jail_name_pid = getpid();
 	test_harness_init();
 
 	/* Coalition Creation */
