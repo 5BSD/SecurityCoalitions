@@ -155,6 +155,13 @@ ioctl(coalition_fd, VBSD_COALITION_HEARTBEAT, NULL);
 watchdog_ms = 0;
 ioctl(coalition_fd, VBSD_COALITION_SET_WATCHDOG, &watchdog_ms);
 
+/* Set leader - if this process dies, terminate coalition */
+ioctl(coalition_fd, VBSD_COALITION_SET_LEADER, &proc_fd);
+
+/* Clear leader */
+int no_leader = -1;
+ioctl(coalition_fd, VBSD_COALITION_SET_LEADER, &no_leader);
+
 /* Or just close - also terminates all members */
 close(coalition_fd);
 ```
@@ -518,6 +525,37 @@ ioctl(coalition_fd, VBSD_COALITION_SET_WATCHDOG, &timeout_ms);
 - Liveness check: "If process hangs and stops heartbeating, kill everything"
 - Orphan prevention: "If parent dies, children should die too"
 
+## Leader Death Trigger
+
+Designate a "leader" process. If it exits for any reason, the entire coalition
+is terminated immediately.
+
+```c
+/* Set a process as leader - its death triggers termination */
+ioctl(coalition_fd, VBSD_COALITION_SET_LEADER, &proc_fd);
+
+/* Clear leader (no automatic termination on any process death) */
+int no_leader = -1;
+ioctl(coalition_fd, VBSD_COALITION_SET_LEADER, &no_leader);
+```
+
+**Requirements**:
+- The process must be enlisted in the coalition (ESRCH if not)
+- The fd must be a valid procdesc (EINVAL if not, EBADF if invalid)
+- Cannot set leader on a terminated coalition (ESHUTDOWN)
+
+**Behavior**:
+1. When the leader process exits (normally or via signal), the exit handler
+   detects this and calls `vbsd_coalition_terminate()`
+2. All other enlisted processes receive SIGKILL
+3. All enlisted jails are removed
+4. The coalition is marked as terminated
+
+**Use cases**:
+- Main process: "If main() exits, kill all helper processes"
+- Session leader: "If shell exits, kill all background jobs"
+- Container init: "If PID 1 dies, tear down the container"
+
 ## Project Structure
 
 ```
@@ -618,6 +656,11 @@ SecurityCoalitions/
 | Watchdog disable | `test_watchdog_disable` | timeout=0 disables watchdog |
 | Watchdog no watchdog | `test_watchdog_heartbeat_no_watchdog` | EINVAL |
 | Watchdog after terminate | `test_watchdog_after_terminate` | ESHUTDOWN |
+| Leader basic | `test_leader_basic` | leader death triggers termination |
+| Leader clear | `test_leader_clear` | clearing leader prevents trigger |
+| Leader not enlisted | `test_leader_not_enlisted` | ESRCH |
+| Leader invalid fd | `test_leader_invalid_fd` | EBADF |
+| Leader after terminate | `test_leader_after_terminate` | ESHUTDOWN |
 | Nested basic | `test_nested_coalition_basic` | success |
 | Nested cascade terminate | `test_nested_coalition_cascade_terminate` | all killed |
 | Nested depth tracking | `test_nested_coalition_depth` | depth correct |
@@ -722,6 +765,7 @@ Coalition defines a DTrace SDT provider `coalition` with the following probes:
 | `coalition:::terminate` | `u_int member_count, int error` | Explicit terminate |
 | `coalition:::close` | `u_int member_count` | Coalition fd closed |
 | `coalition:::member__exit` | `pid_t pid` | Process member exited |
+| `coalition:::leader__exit` | `pid_t pid` | Leader process exited (triggers termination) |
 | `coalition:::fork__inherit` | `pid_t parent, pid_t child` | Child inherited coalition |
 
 **DTrace Usage Examples:**

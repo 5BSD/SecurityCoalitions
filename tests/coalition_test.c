@@ -3741,6 +3741,314 @@ test_watchdog_after_terminate(void)
 }
 
 /* =========================================================================
+ * LEADER DEATH TRIGGER TESTS
+ * ========================================================================= */
+
+/*
+ * Test: Leader death triggers coalition termination
+ *
+ * When the designated leader process exits, the entire coalition
+ * should be terminated.
+ */
+static struct test_result
+test_leader_basic(void)
+{
+	int coal_fd, leader_fd, worker_fd;
+	pid_t leader_pid, worker_pid;
+	int ret, status;
+	int pipe_fds[2];
+
+	coal_fd = create_coalition();
+	TEST_ASSERT(coal_fd >= 0, "Failed to create coalition");
+
+	/* Create pipe for coordination */
+	ret = pipe(pipe_fds);
+	TEST_ASSERT(ret == 0, "pipe failed");
+
+	/* Create leader process */
+	leader_pid = pdfork(&leader_fd, PD_DAEMON);
+	if (leader_pid < 0) {
+		close(coal_fd);
+		close(pipe_fds[0]);
+		close(pipe_fds[1]);
+		return TEST_FAIL("pdfork leader failed");
+	}
+
+	if (leader_pid == 0) {
+		char ready;
+		close(coal_fd);
+		close(pipe_fds[1]);
+		/* Wait for signal to exit */
+		read(pipe_fds[0], &ready, 1);
+		close(pipe_fds[0]);
+		_exit(0);
+	}
+	close(pipe_fds[0]);
+
+	/* Create worker process */
+	worker_pid = pdfork(&worker_fd, PD_DAEMON);
+	if (worker_pid < 0) {
+		pdkill(leader_fd, SIGKILL);
+		close(leader_fd);
+		close(coal_fd);
+		close(pipe_fds[1]);
+		return TEST_FAIL("pdfork worker failed");
+	}
+
+	if (worker_pid == 0) {
+		close(coal_fd);
+		close(leader_fd);
+		close(pipe_fds[1]);
+		while (1)
+			sleep(10);
+		_exit(0);
+	}
+
+	/* Enlist both processes */
+	ret = ioctl(coal_fd, VBSD_COALITION_ENLIST, &leader_fd);
+	if (ret < 0) {
+		pdkill(leader_fd, SIGKILL);
+		pdkill(worker_fd, SIGKILL);
+		close(leader_fd);
+		close(worker_fd);
+		close(coal_fd);
+		close(pipe_fds[1]);
+		return TEST_FAIL("Failed to enlist leader");
+	}
+
+	ret = ioctl(coal_fd, VBSD_COALITION_ENLIST, &worker_fd);
+	if (ret < 0) {
+		pdkill(leader_fd, SIGKILL);
+		pdkill(worker_fd, SIGKILL);
+		close(leader_fd);
+		close(worker_fd);
+		close(coal_fd);
+		close(pipe_fds[1]);
+		return TEST_FAIL("Failed to enlist worker");
+	}
+
+	/* Set leader */
+	ret = ioctl(coal_fd, VBSD_COALITION_SET_LEADER, &leader_fd);
+	TEST_ASSERT(ret == 0, "Failed to set leader");
+
+	/* Signal leader to exit */
+	write(pipe_fds[1], "x", 1);
+	close(pipe_fds[1]);
+
+	/* Wait for leader to exit */
+	ret = waitpid_timeout(leader_pid, &status, 1000);
+	TEST_ASSERT(ret == 0, "Leader should exit");
+
+	/* Worker should be killed due to leader death */
+	ret = waitpid_timeout(worker_pid, &status, 1000);
+	TEST_ASSERT(ret == 0, "Worker should be killed");
+	TEST_ASSERT(WIFSIGNALED(status) && WTERMSIG(status) == SIGKILL,
+	    "Worker should be killed with SIGKILL");
+
+	close(leader_fd);
+	close(worker_fd);
+	close(coal_fd);
+	return TEST_PASS(NULL);
+}
+
+/*
+ * Test: Clear leader prevents death trigger
+ */
+static struct test_result
+test_leader_clear(void)
+{
+	int coal_fd, leader_fd, worker_fd;
+	pid_t leader_pid, worker_pid;
+	int ret, status;
+	int pipe_fds[2];
+	int clear_fd = -1;
+
+	coal_fd = create_coalition();
+	TEST_ASSERT(coal_fd >= 0, "Failed to create coalition");
+
+	/* Create pipe for coordination */
+	ret = pipe(pipe_fds);
+	TEST_ASSERT(ret == 0, "pipe failed");
+
+	/* Create leader process */
+	leader_pid = pdfork(&leader_fd, PD_DAEMON);
+	if (leader_pid < 0) {
+		close(coal_fd);
+		close(pipe_fds[0]);
+		close(pipe_fds[1]);
+		return TEST_FAIL("pdfork leader failed");
+	}
+
+	if (leader_pid == 0) {
+		char ready;
+		close(coal_fd);
+		close(pipe_fds[1]);
+		read(pipe_fds[0], &ready, 1);
+		close(pipe_fds[0]);
+		_exit(0);
+	}
+	close(pipe_fds[0]);
+
+	/* Create worker process */
+	worker_pid = pdfork(&worker_fd, PD_DAEMON);
+	if (worker_pid < 0) {
+		pdkill(leader_fd, SIGKILL);
+		close(leader_fd);
+		close(coal_fd);
+		close(pipe_fds[1]);
+		return TEST_FAIL("pdfork worker failed");
+	}
+
+	if (worker_pid == 0) {
+		close(coal_fd);
+		close(leader_fd);
+		close(pipe_fds[1]);
+		while (1)
+			sleep(10);
+		_exit(0);
+	}
+
+	/* Enlist both */
+	ret = ioctl(coal_fd, VBSD_COALITION_ENLIST, &leader_fd);
+	TEST_ASSERT(ret == 0, "Failed to enlist leader");
+
+	ret = ioctl(coal_fd, VBSD_COALITION_ENLIST, &worker_fd);
+	TEST_ASSERT(ret == 0, "Failed to enlist worker");
+
+	/* Set leader, then clear it */
+	ret = ioctl(coal_fd, VBSD_COALITION_SET_LEADER, &leader_fd);
+	TEST_ASSERT(ret == 0, "Failed to set leader");
+
+	ret = ioctl(coal_fd, VBSD_COALITION_SET_LEADER, &clear_fd);
+	TEST_ASSERT(ret == 0, "Failed to clear leader");
+
+	/* Signal leader to exit */
+	write(pipe_fds[1], "x", 1);
+	close(pipe_fds[1]);
+
+	/* Wait for leader to exit */
+	ret = waitpid_timeout(leader_pid, &status, 1000);
+	TEST_ASSERT(ret == 0, "Leader should exit");
+
+	/* Worker should still be alive (leader was cleared) */
+	ret = waitpid_timeout(worker_pid, &status, 300);
+	TEST_ASSERT(ret == 1 && errno == ETIMEDOUT,
+	    "Worker should still be alive");
+
+	/* Clean up */
+	pdkill(worker_fd, SIGKILL);
+	close(leader_fd);
+	close(worker_fd);
+	close(coal_fd);
+	return TEST_PASS(NULL);
+}
+
+/*
+ * Test: Set leader with non-enlisted process fails
+ */
+static struct test_result
+test_leader_not_enlisted(void)
+{
+	int coal_fd, proc_fd;
+	pid_t pid;
+	int ret;
+
+	coal_fd = create_coalition();
+	TEST_ASSERT(coal_fd >= 0, "Failed to create coalition");
+
+	/* Create process but don't enlist it */
+	pid = pdfork(&proc_fd, PD_DAEMON);
+	if (pid < 0) {
+		close(coal_fd);
+		return TEST_FAIL("pdfork failed");
+	}
+
+	if (pid == 0) {
+		close(coal_fd);
+		while (1)
+			sleep(10);
+		_exit(0);
+	}
+
+	/* Try to set as leader without enlisting */
+	ret = ioctl(coal_fd, VBSD_COALITION_SET_LEADER, &proc_fd);
+	TEST_ASSERT(ret < 0 && errno == ESRCH,
+	    "Set leader of non-enlisted process should fail ESRCH");
+
+	/* Clean up */
+	pdkill(proc_fd, SIGKILL);
+	close(proc_fd);
+	close(coal_fd);
+	return TEST_PASS(NULL);
+}
+
+/*
+ * Test: Set leader with invalid fd fails
+ */
+static struct test_result
+test_leader_invalid_fd(void)
+{
+	int coal_fd;
+	int bad_fd = 9999;
+	int ret;
+
+	coal_fd = create_coalition();
+	TEST_ASSERT(coal_fd >= 0, "Failed to create coalition");
+
+	/* Try to set leader with invalid fd */
+	ret = ioctl(coal_fd, VBSD_COALITION_SET_LEADER, &bad_fd);
+	TEST_ASSERT(ret < 0 && errno == EBADF,
+	    "Set leader with bad fd should fail EBADF");
+
+	close(coal_fd);
+	return TEST_PASS(NULL);
+}
+
+/*
+ * Test: Set leader after terminate fails
+ */
+static struct test_result
+test_leader_after_terminate(void)
+{
+	int coal_fd, proc_fd;
+	pid_t pid;
+	int ret;
+
+	coal_fd = create_coalition();
+	TEST_ASSERT(coal_fd >= 0, "Failed to create coalition");
+
+	/* Create and enlist a process */
+	pid = pdfork(&proc_fd, PD_DAEMON);
+	if (pid < 0) {
+		close(coal_fd);
+		return TEST_FAIL("pdfork failed");
+	}
+
+	if (pid == 0) {
+		close(coal_fd);
+		while (1)
+			sleep(10);
+		_exit(0);
+	}
+
+	ret = ioctl(coal_fd, VBSD_COALITION_ENLIST, &proc_fd);
+	TEST_ASSERT(ret == 0, "Failed to enlist process");
+
+	/* Terminate coalition */
+	ret = ioctl(coal_fd, VBSD_COALITION_TERMINATE);
+	TEST_ASSERT(ret == 0, "Terminate should succeed");
+
+	/* Try to set leader after terminate */
+	ret = ioctl(coal_fd, VBSD_COALITION_SET_LEADER, &proc_fd);
+	TEST_ASSERT(ret < 0 && errno == ESHUTDOWN,
+	    "Set leader after terminate should fail ESHUTDOWN");
+
+	close(proc_fd);
+	close(coal_fd);
+	return TEST_PASS(NULL);
+}
+
+/* =========================================================================
  * NESTED COALITION TESTS
  * ========================================================================= */
 
@@ -4183,6 +4491,18 @@ main(int argc __unused, char *argv[] __unused)
 	    "Heartbeat without watchdog fails", test_watchdog_heartbeat_no_watchdog);
 	test_harness_register("test_watchdog_after_terminate",
 	    "Set watchdog after terminate fails", test_watchdog_after_terminate);
+
+	/* Leader death trigger tests */
+	test_harness_register("test_leader_basic",
+	    "Leader death triggers termination", test_leader_basic);
+	test_harness_register("test_leader_clear",
+	    "Clear leader prevents death trigger", test_leader_clear);
+	test_harness_register("test_leader_not_enlisted",
+	    "Set leader of non-enlisted fails", test_leader_not_enlisted);
+	test_harness_register("test_leader_invalid_fd",
+	    "Set leader with invalid fd fails", test_leader_invalid_fd);
+	test_harness_register("test_leader_after_terminate",
+	    "Set leader after terminate fails", test_leader_after_terminate);
 
 	/* Nested coalition tests */
 	test_harness_register("test_nested_coalition_basic",

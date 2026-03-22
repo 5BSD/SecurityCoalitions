@@ -91,6 +91,10 @@ SDT_PROBE_DEFINE1(coalition, , , close,
 SDT_PROBE_DEFINE1(coalition, , , member__exit,
     "pid_t");
 
+/* coalition:::leader__exit(pid_t pid) - leader death triggers termination */
+SDT_PROBE_DEFINE1(coalition, , , leader__exit,
+    "pid_t");
+
 /* coalition:::fork__inherit(pid_t parent, pid_t child) */
 SDT_PROBE_DEFINE2(coalition, , , fork__inherit,
     "pid_t", "pid_t")
@@ -1760,6 +1764,16 @@ vbsd_process_exit(void *arg __unused, struct proc *p)
 	 * fo_close runs.
 	 */
 
+	/*
+	 * Check if this was the leader process. If so, terminate the
+	 * entire coalition. We can safely take vc_sx here because we've
+	 * already released the hash lock.
+	 */
+	if ((vc->vc_flags & VCF_HAS_LEADER) && p->p_pid == vc->vc_leader_pid) {
+		SDT_PROBE1(coalition, , , leader__exit, p->p_pid);
+		vbsd_coalition_terminate(vc);
+	}
+
 	/* Release only our temp reference */
 	vbsd_coalition_rel(vc);
 }
@@ -2183,6 +2197,87 @@ vbsd_coalition_fo_ioctl(struct file *fp, u_long cmd, void *data,
 			    vc->vc_watchdog_timeout_ms * hz / 1000,
 			    vbsd_watchdog_callout, vc);
 
+			sx_xunlock(&vc->vc_sx);
+			error = 0;
+		}
+		break;
+
+	case VBSD_COALITION_SET_LEADER:
+		{
+			int target_fd;
+			struct file *target_fp;
+			struct vbsd_member *vm;
+			struct procdesc *pd;
+			struct proc *p;
+			pid_t pid;
+
+			target_fd = *(int *)data;
+
+			sx_xlock(&vc->vc_sx);
+
+			if (vc->vc_flags & VCF_TERMINATING) {
+				sx_xunlock(&vc->vc_sx);
+				error = ESHUTDOWN;
+				break;
+			}
+
+			/* Clear leader if fd is -1 */
+			if (target_fd == -1) {
+				vc->vc_leader_pid = 0;
+				vc->vc_flags &= ~VCF_HAS_LEADER;
+				sx_xunlock(&vc->vc_sx);
+				error = 0;
+				break;
+			}
+
+			/* Get the target file descriptor */
+			error = fget(td, target_fd, &cap_no_rights, &target_fp);
+			if (error != 0) {
+				sx_xunlock(&vc->vc_sx);
+				break;
+			}
+
+			/* Must be a process descriptor */
+			if (target_fp->f_type != DTYPE_PROCDESC) {
+				fdrop(target_fp, td);
+				sx_xunlock(&vc->vc_sx);
+				error = EINVAL;
+				break;
+			}
+
+			/* Find this fd in our member list */
+			TAILQ_FOREACH(vm, &vc->vc_members, vm_link) {
+				if (vm->vm_fp == target_fp &&
+				    vm->vm_ops == &vbsd_proc_ops)
+					break;
+			}
+
+			if (vm == NULL) {
+				/* Not enlisted in this coalition */
+				fdrop(target_fp, td);
+				sx_xunlock(&vc->vc_sx);
+				error = ESRCH;
+				break;
+			}
+
+			/* Get the process and its pid */
+			pd = target_fp->f_data;
+			sx_slock(&proctree_lock);
+			p = pd->pd_proc;
+			if (p == NULL || (p->p_flag & P_WEXIT)) {
+				sx_sunlock(&proctree_lock);
+				fdrop(target_fp, td);
+				sx_xunlock(&vc->vc_sx);
+				error = ESRCH;
+				break;
+			}
+			pid = p->p_pid;
+			sx_sunlock(&proctree_lock);
+
+			vc->vc_leader_pid = pid;
+			vc->vc_flags |= VCF_HAS_LEADER;
+
+			fdrop(target_fp, td);
 			sx_xunlock(&vc->vc_sx);
 			error = 0;
 		}
