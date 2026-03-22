@@ -4,6 +4,22 @@
 
 Coalitions provide capability-based resource group management for FreeBSD. A coalition groups file descriptors representing capabilities (processes, jails, sockets, devices, etc.) that should be terminated together when the coalition is closed.
 
+## Comparison with Apple's Coalitions
+
+Apple's macOS/iOS also has a feature called "coalitions" (introduced in OS X 10.10). While the name is similar, the goals differ:
+
+| Aspect | Apple Coalitions (XNU) | vBSD Coalition |
+|--------|------------------------|----------------|
+| **Primary Purpose** | Resource accounting & memory management | Kill switch / coordinated termination |
+| **Focus** | CPU/memory tracking, jetsam, app grouping | Authority to revoke/terminate resources |
+| **Member Types** | Processes only | Processes, jails, sockets, SHM, devices, custom types |
+| **Authority Model** | Kernel-managed, launchd-driven | Capability-based (fd = authority) |
+| **Resource Limits** | Per-coalition CPU/memory limits | No resource accounting |
+
+**Apple's coalitions** group apps with their XPC services for resource accounting, memory pressure responses (jetsam), and background app management.
+
+**vBSD Coalition** implements a supervisor pattern where closing a file descriptor terminates all enlisted resources. Authority is a capability (fd) that can be passed, duplicated, or restricted with Capsicum.
+
 ## Core Philosophy
 
 **Capabilities are file descriptors.** In Capsicum, authority is held via file descriptors. Coalitions extend this: the authority to terminate/revoke a resource is also a capability, held via the coalition fd.
@@ -570,9 +586,9 @@ Coalition implements tunable resource limits via sysctl:
 
 | Sysctl | Default | Description |
 |--------|---------|-------------|
-| `kern.coalition.max_coalitions` | 4096 | Maximum concurrent coalitions (0 = unlimited) |
-| `kern.coalition.max_members` | 65536 | Maximum total members across all coalitions (0 = unlimited) |
-| `kern.coalition.max_members_per_coalition` | 1024 | Maximum members per coalition (0 = unlimited) |
+| `kern.coalition.max_coalitions` | 0 | Maximum concurrent coalitions (0 = unlimited) |
+| `kern.coalition.max_members` | 0 | Maximum total members across all coalitions (0 = unlimited) |
+| `kern.coalition.max_members_per_coalition` | 0 | Maximum members per coalition (0 = unlimited) |
 | `kern.coalition.enlist_set_max` | 1024 | Maximum fds per VBSD_COALITION_ENLIST_SET call |
 
 Resource limit checks return `ENOMEM` when exceeded. Fork inheritance is exempt

@@ -408,7 +408,8 @@ static struct vbsd_member_ops vbsd_proc_ops = {
 
 /*
  * Jail member data, stored in vm_data.
- * We need the prison pointer for prison_remove().
+ * Note: vjd_prison is only used during enlistment to set up OSD.
+ * After enlistment, vbsd_jail_terminate() gets prison from fp->f_data.
  */
 struct vbsd_jail_data {
 	struct prison	*vjd_prison;
@@ -1156,7 +1157,6 @@ vbsd_coalition_enlist_generic(struct vbsd_coalition *vc, struct thread *td,
 	}
 
 	atomic_add_int(&vc->vc_member_count, 1);
-	/* Note: member_count already incremented by vbsd_member_ops_acquire */
 
 	vbsd_coalition_ref(vc);
 	sx_xunlock(&vc->vc_sx);
@@ -2023,12 +2023,9 @@ vbsd_coalition_fo_close(struct file *fp, struct thread *td)
 	 */
 	for (vm = jail_list; vm != NULL; ) {
 		struct vbsd_member *next = (struct vbsd_member *)vm->vm_link.tqe_next;
-		struct vbsd_jail_data *vjd;
 		struct jaildesc *jd;
 		struct prison *pr;
 		struct vbsd_jail_osd *vjo;
-
-		vjd = vm->vm_data;
 
 		/*
 		 * Step 1: Clear the OSD's member pointer FIRST.
@@ -2062,9 +2059,6 @@ vbsd_coalition_fo_close(struct file *fp, struct thread *td)
 		if (vm->vm_fp != NULL && vm->vm_ops != NULL &&
 		    vm->vm_ops->mo_terminate != NULL)
 			(void)vm->vm_ops->mo_terminate(vm->vm_fp, td);
-
-		if (vjd != NULL)
-			vjd->vjd_prison = NULL;
 
 		atomic_subtract_int(&vc->vc_member_count, 1);
 		vbsd_member_ops_release(vm->vm_dtype);
