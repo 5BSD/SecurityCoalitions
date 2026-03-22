@@ -3526,6 +3526,221 @@ test_deadline_invalid_signal(void)
 }
 
 /* =========================================================================
+ * WATCHDOG TESTS
+ * ========================================================================= */
+
+/*
+ * Test: Basic watchdog - coalition killed if no heartbeat
+ */
+static struct test_result
+test_watchdog_basic(void)
+{
+	int coal_fd, proc_fd;
+	pid_t pid;
+	uint32_t timeout_ms = 500;
+	int ret, status;
+
+	coal_fd = create_coalition();
+	TEST_ASSERT(coal_fd >= 0, "Failed to create coalition");
+
+	pid = pdfork(&proc_fd, PD_DAEMON);
+	if (pid < 0) {
+		close(coal_fd);
+		return TEST_FAIL("pdfork failed");
+	}
+
+	if (pid == 0) {
+		close(coal_fd);
+		while (1)
+			sleep(10);
+		_exit(0);
+	}
+
+	ret = ioctl(coal_fd, VBSD_COALITION_ENLIST, &proc_fd);
+	if (ret < 0) {
+		pdkill(proc_fd, SIGKILL);
+		close(proc_fd);
+		close(coal_fd);
+		return TEST_FAIL("Failed to enlist process");
+	}
+
+	/* Enable watchdog */
+	ret = ioctl(coal_fd, VBSD_COALITION_SET_WATCHDOG, &timeout_ms);
+	TEST_ASSERT(ret == 0, "Failed to set watchdog");
+
+	/* Don't heartbeat - let it expire */
+	ret = waitpid_timeout(pid, &status, 1500);
+	TEST_ASSERT(ret == 0, "Process should be killed by watchdog");
+	TEST_ASSERT(WIFSIGNALED(status) && WTERMSIG(status) == SIGKILL,
+	    "Process should be killed with SIGKILL");
+
+	close(proc_fd);
+	close(coal_fd);
+	return TEST_PASS(NULL);
+}
+
+/*
+ * Test: Heartbeat keeps coalition alive
+ */
+static struct test_result
+test_watchdog_heartbeat(void)
+{
+	int coal_fd, proc_fd;
+	pid_t pid;
+	uint32_t timeout_ms = 300;
+	int ret, status, i;
+
+	coal_fd = create_coalition();
+	TEST_ASSERT(coal_fd >= 0, "Failed to create coalition");
+
+	pid = pdfork(&proc_fd, PD_DAEMON);
+	if (pid < 0) {
+		close(coal_fd);
+		return TEST_FAIL("pdfork failed");
+	}
+
+	if (pid == 0) {
+		close(coal_fd);
+		while (1)
+			sleep(10);
+		_exit(0);
+	}
+
+	ret = ioctl(coal_fd, VBSD_COALITION_ENLIST, &proc_fd);
+	if (ret < 0) {
+		pdkill(proc_fd, SIGKILL);
+		close(proc_fd);
+		close(coal_fd);
+		return TEST_FAIL("Failed to enlist process");
+	}
+
+	/* Enable watchdog */
+	ret = ioctl(coal_fd, VBSD_COALITION_SET_WATCHDOG, &timeout_ms);
+	TEST_ASSERT(ret == 0, "Failed to set watchdog");
+
+	/* Heartbeat several times, keeping watchdog from expiring */
+	for (i = 0; i < 5; i++) {
+		usleep(150000);  /* 150ms - before timeout */
+		ret = ioctl(coal_fd, VBSD_COALITION_HEARTBEAT, NULL);
+		TEST_ASSERT(ret == 0, "Heartbeat failed");
+	}
+
+	/* Process should still be alive after 750ms of heartbeating */
+	ret = waitpid_timeout(pid, &status, 100);
+	TEST_ASSERT(ret == 1 && errno == ETIMEDOUT,
+	    "Process should still be alive");
+
+	/* Clean up */
+	pdkill(proc_fd, SIGKILL);
+	close(proc_fd);
+	close(coal_fd);
+	return TEST_PASS(NULL);
+}
+
+/*
+ * Test: Disable watchdog with timeout=0
+ */
+static struct test_result
+test_watchdog_disable(void)
+{
+	int coal_fd, proc_fd;
+	pid_t pid;
+	uint32_t timeout_ms = 300;
+	int ret, status;
+
+	coal_fd = create_coalition();
+	TEST_ASSERT(coal_fd >= 0, "Failed to create coalition");
+
+	pid = pdfork(&proc_fd, PD_DAEMON);
+	if (pid < 0) {
+		close(coal_fd);
+		return TEST_FAIL("pdfork failed");
+	}
+
+	if (pid == 0) {
+		close(coal_fd);
+		while (1)
+			sleep(10);
+		_exit(0);
+	}
+
+	ret = ioctl(coal_fd, VBSD_COALITION_ENLIST, &proc_fd);
+	if (ret < 0) {
+		pdkill(proc_fd, SIGKILL);
+		close(proc_fd);
+		close(coal_fd);
+		return TEST_FAIL("Failed to enlist process");
+	}
+
+	/* Enable watchdog */
+	ret = ioctl(coal_fd, VBSD_COALITION_SET_WATCHDOG, &timeout_ms);
+	TEST_ASSERT(ret == 0, "Failed to set watchdog");
+
+	/* Disable watchdog */
+	timeout_ms = 0;
+	ret = ioctl(coal_fd, VBSD_COALITION_SET_WATCHDOG, &timeout_ms);
+	TEST_ASSERT(ret == 0, "Failed to disable watchdog");
+
+	/* Wait past original timeout - process should survive */
+	ret = waitpid_timeout(pid, &status, 600);
+	TEST_ASSERT(ret == 1 && errno == ETIMEDOUT,
+	    "Process should still be alive (watchdog disabled)");
+
+	/* Clean up */
+	pdkill(proc_fd, SIGKILL);
+	close(proc_fd);
+	close(coal_fd);
+	return TEST_PASS(NULL);
+}
+
+/*
+ * Test: Heartbeat without watchdog fails
+ */
+static struct test_result
+test_watchdog_heartbeat_no_watchdog(void)
+{
+	int coal_fd;
+	int ret;
+
+	coal_fd = create_coalition();
+	TEST_ASSERT(coal_fd >= 0, "Failed to create coalition");
+
+	/* Heartbeat without enabling watchdog should fail */
+	ret = ioctl(coal_fd, VBSD_COALITION_HEARTBEAT, NULL);
+	TEST_ASSERT(ret < 0 && errno == EINVAL,
+	    "Heartbeat without watchdog should return EINVAL");
+
+	close(coal_fd);
+	return TEST_PASS(NULL);
+}
+
+/*
+ * Test: Watchdog after terminate fails
+ */
+static struct test_result
+test_watchdog_after_terminate(void)
+{
+	int coal_fd;
+	uint32_t timeout_ms = 1000;
+	int ret;
+
+	coal_fd = create_coalition();
+	TEST_ASSERT(coal_fd >= 0, "Failed to create coalition");
+
+	/* Terminate first */
+	ret = ioctl(coal_fd, VBSD_COALITION_TERMINATE);
+	TEST_ASSERT(ret == 0, "Terminate should succeed");
+
+	/* Try to set watchdog */
+	ret = ioctl(coal_fd, VBSD_COALITION_SET_WATCHDOG, &timeout_ms);
+	TEST_ASSERT(ret < 0 && errno == ESHUTDOWN,
+	    "Set watchdog after terminate should fail ESHUTDOWN");
+
+	close(coal_fd);
+	return TEST_PASS(NULL);
+}
+
+/* =========================================================================
  * NESTED COALITION TESTS
  * ========================================================================= */
 
@@ -3956,6 +4171,18 @@ main(int argc __unused, char *argv[] __unused)
 	    "Set deadline after terminate fails", test_deadline_after_terminate);
 	test_harness_register("test_deadline_invalid_signal",
 	    "Deadline with invalid signal fails", test_deadline_invalid_signal);
+
+	/* Watchdog tests */
+	test_harness_register("test_watchdog_basic",
+	    "Watchdog kills on timeout", test_watchdog_basic);
+	test_harness_register("test_watchdog_heartbeat",
+	    "Heartbeat keeps coalition alive", test_watchdog_heartbeat);
+	test_harness_register("test_watchdog_disable",
+	    "Disable watchdog with timeout=0", test_watchdog_disable);
+	test_harness_register("test_watchdog_heartbeat_no_watchdog",
+	    "Heartbeat without watchdog fails", test_watchdog_heartbeat_no_watchdog);
+	test_harness_register("test_watchdog_after_terminate",
+	    "Set watchdog after terminate fails", test_watchdog_after_terminate);
 
 	/* Nested coalition tests */
 	test_harness_register("test_nested_coalition_basic",

@@ -273,6 +273,8 @@ static void		vbsd_coalition_terminate_members_locked(
 			    bool skip_self);
 static void		vbsd_deadline_callout(void *arg);
 static void		vbsd_deadline_task_fn(void *context, int pending);
+static void		vbsd_watchdog_callout(void *arg);
+static void		vbsd_watchdog_task_fn(void *context, int pending);
 
 /* ========================================================================
  * Sysctl Interface and Resource Limits
@@ -638,6 +640,8 @@ vbsd_coalition_alloc(void)
 	vc->vc_flags = 0;
 	callout_init(&vc->vc_deadline_callout, 1);  /* MPSAFE */
 	TASK_INIT(&vc->vc_deadline_task, 0, vbsd_deadline_task_fn, vc);
+	callout_init(&vc->vc_watchdog_callout, 1);  /* MPSAFE */
+	TASK_INIT(&vc->vc_watchdog_task, 0, vbsd_watchdog_task_fn, vc);
 	refcount_init(&vc->vc_refcount, 1);
 	atomic_add_int(&vbsd_coalition_count, 1);
 
@@ -764,6 +768,52 @@ vbsd_deadline_callout(void *arg)
 	 * Reference was taken when callout was scheduled.
 	 */
 	taskqueue_enqueue(taskqueue_thread, &vc->vc_deadline_task);
+}
+
+/* ========================================================================
+ * Watchdog
+ * ======================================================================== */
+
+/*
+ * Task function for watchdog expiration.
+ * Runs in thread context, terminates the coalition.
+ */
+static void
+vbsd_watchdog_task_fn(void *context, int pending __unused)
+{
+	struct vbsd_coalition *vc = context;
+	struct thread *td = curthread;
+
+	sx_xlock(&vc->vc_sx);
+
+	/*
+	 * Check if coalition was already terminated or watchdog disabled.
+	 */
+	if ((vc->vc_flags & VCF_TERMINATING) ||
+	    !(vc->vc_flags & VCF_WATCHDOG_ACTIVE)) {
+		sx_xunlock(&vc->vc_sx);
+		vbsd_coalition_rel(vc);
+		return;
+	}
+
+	/* Watchdog expired - terminate everything */
+	vc->vc_flags &= ~VCF_WATCHDOG_ACTIVE;
+	vbsd_coalition_terminate_members_locked(vc, td, false);
+
+	sx_xunlock(&vc->vc_sx);
+	vbsd_coalition_rel(vc);
+}
+
+/*
+ * Callout function for watchdog.
+ * Runs in softirq context, schedules task for termination.
+ */
+static void
+vbsd_watchdog_callout(void *arg)
+{
+	struct vbsd_coalition *vc = arg;
+
+	taskqueue_enqueue(taskqueue_thread, &vc->vc_watchdog_task);
 }
 
 static int
@@ -2066,6 +2116,78 @@ vbsd_coalition_fo_ioctl(struct file *fp, u_long cmd, void *data,
 		}
 		break;
 
+	case VBSD_COALITION_SET_WATCHDOG:
+		{
+			uint32_t timeout_ms = *(uint32_t *)data;
+
+			sx_xlock(&vc->vc_sx);
+
+			if (vc->vc_flags & VCF_TERMINATING) {
+				sx_xunlock(&vc->vc_sx);
+				error = ESHUTDOWN;
+				break;
+			}
+
+			/*
+			 * Cancel any existing watchdog first.
+			 */
+			if (vc->vc_flags & VCF_WATCHDOG_ACTIVE) {
+				vc->vc_flags &= ~VCF_WATCHDOG_ACTIVE;
+				if (callout_stop(&vc->vc_watchdog_callout))
+					vbsd_coalition_rel(vc);
+			}
+
+			if (timeout_ms == 0) {
+				/* Just disable watchdog */
+				sx_xunlock(&vc->vc_sx);
+				error = 0;
+				break;
+			}
+
+			/* Enable watchdog */
+			vc->vc_watchdog_timeout_ms = timeout_ms;
+			vc->vc_flags |= VCF_WATCHDOG_ACTIVE;
+			vbsd_coalition_ref(vc);
+			callout_reset(&vc->vc_watchdog_callout,
+			    timeout_ms * hz / 1000,
+			    vbsd_watchdog_callout, vc);
+
+			sx_xunlock(&vc->vc_sx);
+			error = 0;
+		}
+		break;
+
+	case VBSD_COALITION_HEARTBEAT:
+		{
+			sx_xlock(&vc->vc_sx);
+
+			if (vc->vc_flags & VCF_TERMINATING) {
+				sx_xunlock(&vc->vc_sx);
+				error = ESHUTDOWN;
+				break;
+			}
+
+			if (!(vc->vc_flags & VCF_WATCHDOG_ACTIVE)) {
+				/* No watchdog enabled */
+				sx_xunlock(&vc->vc_sx);
+				error = EINVAL;
+				break;
+			}
+
+			/*
+			 * Reset the watchdog timer.
+			 * callout_reset on an already-scheduled callout
+			 * just reschedules it.
+			 */
+			callout_reset(&vc->vc_watchdog_callout,
+			    vc->vc_watchdog_timeout_ms * hz / 1000,
+			    vbsd_watchdog_callout, vc);
+
+			sx_xunlock(&vc->vc_sx);
+			error = 0;
+		}
+		break;
+
 	default:
 		error = ENOTTY;
 		break;
@@ -2095,12 +2217,14 @@ vbsd_coalition_fo_close(struct file *fp, struct thread *td)
 	KASSERT(vc != NULL, ("vbsd_coalition_fo_close: NULL vc"));
 
 	/*
-	 * Drain any pending deadline callout/task before acquiring vc_sx.
-	 * This prevents deadlock since the task also acquires vc_sx.
+	 * Drain any pending deadline/watchdog callout/task before acquiring vc_sx.
+	 * This prevents deadlock since the tasks also acquire vc_sx.
 	 * We drain unconditionally because checking flags without lock is racy.
 	 */
 	callout_drain(&vc->vc_deadline_callout);
 	taskqueue_drain(taskqueue_thread, &vc->vc_deadline_task);
+	callout_drain(&vc->vc_watchdog_callout);
+	taskqueue_drain(taskqueue_thread, &vc->vc_watchdog_task);
 
 	member_count = atomic_load_acq_int(&vc->vc_member_count);
 	SDT_PROBE1(coalition, , , close, member_count);
@@ -2109,11 +2233,15 @@ vbsd_coalition_fo_close(struct file *fp, struct thread *td)
 	sx_xlock(&vc->vc_sx);
 
 	/*
-	 * If deadline was active, release the reference that was held for
-	 * the callout/task. The drain above ensures nothing is running.
+	 * If deadline/watchdog was active, release the reference that was held
+	 * for the callout/task. The drain above ensures nothing is running.
 	 */
 	if (vc->vc_flags & VCF_DEADLINE_ACTIVE) {
 		vc->vc_flags &= ~(VCF_DEADLINE_ACTIVE | VCF_DEADLINE_GRACE);
+		vbsd_coalition_rel(vc);
+	}
+	if (vc->vc_flags & VCF_WATCHDOG_ACTIVE) {
+		vc->vc_flags &= ~VCF_WATCHDOG_ACTIVE;
 		vbsd_coalition_rel(vc);
 	}
 	vbsd_coalition_terminate_members_locked(vc, td, true);

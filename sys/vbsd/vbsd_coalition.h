@@ -126,6 +126,8 @@
 #define VBSD_COALITION_SET_SIGNAL	_IOW('V', 6, int)
 #define VBSD_COALITION_TERMINATE_GRACEFUL _IOW('V', 7, struct vbsd_graceful)
 #define VBSD_COALITION_SET_DEADLINE	_IOW('V', 8, struct vbsd_deadline)
+#define VBSD_COALITION_SET_WATCHDOG	_IOW('V', 9, uint32_t)
+#define VBSD_COALITION_HEARTBEAT	_IO('V', 10)
 
 /*
  * Batch enlistment structure.
@@ -331,6 +333,7 @@ struct prison;
 #define VCF_TERMINATING		0x0001
 #define VCF_DEADLINE_ACTIVE	0x0002	/* Deadline timer is running */
 #define VCF_DEADLINE_GRACE	0x0004	/* In grace period after initial signal */
+#define VCF_WATCHDOG_ACTIVE	0x0008	/* Watchdog timer is running */
 
 /*
  * Lock order: vbsd_proc_hash_lock -> vc_sx
@@ -349,6 +352,11 @@ struct vbsd_coalition {
 	struct task			vc_deadline_task;
 	int				vc_deadline_signal;  /* Signal before SIGKILL */
 	uint32_t			vc_deadline_grace_ms; /* Grace period */
+
+	/* Watchdog */
+	struct callout			vc_watchdog_callout;
+	struct task			vc_watchdog_task;
+	uint32_t			vc_watchdog_timeout_ms;
 };
 
 /*

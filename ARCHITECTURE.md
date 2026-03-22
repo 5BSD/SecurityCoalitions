@@ -144,6 +144,17 @@ ioctl(coalition_fd, VBSD_COALITION_SET_DEADLINE, &d);
 d.vd_timeout_ms = 0;
 ioctl(coalition_fd, VBSD_COALITION_SET_DEADLINE, &d);
 
+/* Set watchdog - must heartbeat periodically or coalition dies */
+uint32_t watchdog_ms = 5000;  /* 5 second timeout */
+ioctl(coalition_fd, VBSD_COALITION_SET_WATCHDOG, &watchdog_ms);
+
+/* Reset watchdog timer (must call before timeout expires) */
+ioctl(coalition_fd, VBSD_COALITION_HEARTBEAT, NULL);
+
+/* Disable watchdog */
+watchdog_ms = 0;
+ioctl(coalition_fd, VBSD_COALITION_SET_WATCHDOG, &watchdog_ms);
+
 /* Or just close - also terminates all members */
 close(coalition_fd);
 ```
@@ -477,6 +488,36 @@ ioctl(coalition_fd, VBSD_COALITION_SET_DEADLINE, &d);
 - Sandbox timeout: "WebAssembly module gets 30 seconds max"
 - Serverless function timeout: "Lambda must complete in 15 minutes"
 
+## Watchdog / Heartbeat
+
+Detect hung processes or crashed supervisors. The coalition is terminated if
+the supervisor fails to send periodic heartbeats.
+
+```c
+/* Enable watchdog - must heartbeat within timeout or coalition dies */
+uint32_t timeout_ms = 5000;  /* 5 seconds */
+ioctl(coalition_fd, VBSD_COALITION_SET_WATCHDOG, &timeout_ms);
+
+/* Reset the watchdog timer - call this periodically */
+ioctl(coalition_fd, VBSD_COALITION_HEARTBEAT, NULL);
+
+/* Disable watchdog */
+timeout_ms = 0;
+ioctl(coalition_fd, VBSD_COALITION_SET_WATCHDOG, &timeout_ms);
+```
+
+**Behavior**:
+1. `SET_WATCHDOG` with timeout > 0 enables the watchdog timer
+2. `HEARTBEAT` resets the timer to the configured timeout
+3. If timer expires without heartbeat, coalition is terminated (SIGKILL)
+4. `SET_WATCHDOG` with timeout = 0 disables the watchdog
+5. Closing coalition cancels the watchdog
+
+**Use cases**:
+- Supervisor health: "If supervisor crashes, kill all workers"
+- Liveness check: "If process hangs and stops heartbeating, kill everything"
+- Orphan prevention: "If parent dies, children should die too"
+
 ## Project Structure
 
 ```
@@ -572,6 +613,11 @@ SecurityCoalitions/
 | Deadline with grace | `test_deadline_with_grace` | SIGTERM then SIGKILL |
 | Deadline after terminate | `test_deadline_after_terminate` | ESHUTDOWN |
 | Deadline invalid signal | `test_deadline_invalid_signal` | EINVAL |
+| Watchdog basic | `test_watchdog_basic` | coalition killed on timeout |
+| Watchdog heartbeat | `test_watchdog_heartbeat` | heartbeat keeps coalition alive |
+| Watchdog disable | `test_watchdog_disable` | timeout=0 disables watchdog |
+| Watchdog no watchdog | `test_watchdog_heartbeat_no_watchdog` | EINVAL |
+| Watchdog after terminate | `test_watchdog_after_terminate` | ESHUTDOWN |
 | Nested basic | `test_nested_coalition_basic` | success |
 | Nested cascade terminate | `test_nested_coalition_cascade_terminate` | all killed |
 | Nested depth tracking | `test_nested_coalition_depth` | depth correct |
