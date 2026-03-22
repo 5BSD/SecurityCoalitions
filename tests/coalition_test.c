@@ -3301,6 +3301,7 @@ test_deadline_basic(void)
 	ret = ioctl(coal_fd, VBSD_COALITION_ENLIST, &proc_fd);
 	if (ret < 0) {
 		pdkill(proc_fd, SIGKILL);
+		waitpid(pid, NULL, 0);
 		close(proc_fd);
 		close(coal_fd);
 		return TEST_FAIL("Failed to enlist process");
@@ -3308,13 +3309,28 @@ test_deadline_basic(void)
 
 	/* Set deadline */
 	ret = ioctl(coal_fd, VBSD_COALITION_SET_DEADLINE, &d);
-	TEST_ASSERT(ret == 0, "Failed to set deadline");
+	if (ret != 0) {
+		pdkill(proc_fd, SIGKILL);
+		waitpid(pid, NULL, 0);
+		close(proc_fd);
+		close(coal_fd);
+		return TEST_FAIL("Failed to set deadline");
+	}
 
 	/* Wait for deadline to fire (should kill process) */
 	ret = waitpid_timeout(pid, &status, 1500);
-	TEST_ASSERT(ret == 0, "Process should be killed by deadline");
-	TEST_ASSERT(WIFSIGNALED(status) && WTERMSIG(status) == SIGKILL,
-	    "Process should be killed with SIGKILL");
+	if (ret != 0) {
+		pdkill(proc_fd, SIGKILL);
+		waitpid(pid, NULL, 0);
+		close(proc_fd);
+		close(coal_fd);
+		return TEST_FAIL("Process should be killed by deadline");
+	}
+	if (!(WIFSIGNALED(status) && WTERMSIG(status) == SIGKILL)) {
+		close(proc_fd);
+		close(coal_fd);
+		return TEST_FAIL("Process should be killed with SIGKILL");
+	}
 
 	close(proc_fd);
 	close(coal_fd);
@@ -3355,6 +3371,7 @@ test_deadline_cancel(void)
 	ret = ioctl(coal_fd, VBSD_COALITION_ENLIST, &proc_fd);
 	if (ret < 0) {
 		pdkill(proc_fd, SIGKILL);
+		waitpid(pid, NULL, 0);
 		close(proc_fd);
 		close(coal_fd);
 		return TEST_FAIL("Failed to enlist process");
@@ -3362,20 +3379,38 @@ test_deadline_cancel(void)
 
 	/* Set deadline */
 	ret = ioctl(coal_fd, VBSD_COALITION_SET_DEADLINE, &d);
-	TEST_ASSERT(ret == 0, "Failed to set deadline");
+	if (ret != 0) {
+		pdkill(proc_fd, SIGKILL);
+		waitpid(pid, NULL, 0);
+		close(proc_fd);
+		close(coal_fd);
+		return TEST_FAIL("Failed to set deadline");
+	}
 
 	/* Cancel deadline */
 	d.vd_timeout_ms = 0;
 	ret = ioctl(coal_fd, VBSD_COALITION_SET_DEADLINE, &d);
-	TEST_ASSERT(ret == 0, "Failed to cancel deadline");
+	if (ret != 0) {
+		pdkill(proc_fd, SIGKILL);
+		waitpid(pid, NULL, 0);
+		close(proc_fd);
+		close(coal_fd);
+		return TEST_FAIL("Failed to cancel deadline");
+	}
 
 	/* Wait a bit - process should NOT be killed */
 	ret = waitpid_timeout(pid, &status, 800);
-	TEST_ASSERT(ret == 1 && errno == ETIMEDOUT,
-	    "Process should still be alive (deadline cancelled)");
+	if (!(ret == 1 && errno == ETIMEDOUT)) {
+		pdkill(proc_fd, SIGKILL);
+		waitpid(pid, NULL, 0);
+		close(proc_fd);
+		close(coal_fd);
+		return TEST_FAIL("Process should still be alive (deadline cancelled)");
+	}
 
 	/* Clean up */
 	pdkill(proc_fd, SIGKILL);
+	waitpid(pid, NULL, 0);
 	close(proc_fd);
 	close(coal_fd);
 	return TEST_PASS(NULL);
@@ -3446,6 +3481,7 @@ test_deadline_with_grace(void)
 	ret = ioctl(coal_fd, VBSD_COALITION_ENLIST, &proc_fd);
 	if (ret < 0) {
 		pdkill(proc_fd, SIGKILL);
+		waitpid(pid, NULL, 0);
 		close(proc_fd);
 		close(coal_fd);
 		return TEST_FAIL("Failed to enlist process");
@@ -3453,7 +3489,13 @@ test_deadline_with_grace(void)
 
 	/* Set deadline with grace period */
 	ret = ioctl(coal_fd, VBSD_COALITION_SET_DEADLINE, &d);
-	TEST_ASSERT(ret == 0, "Failed to set deadline");
+	if (ret != 0) {
+		pdkill(proc_fd, SIGKILL);
+		waitpid(pid, NULL, 0);
+		close(proc_fd);
+		close(coal_fd);
+		return TEST_FAIL("Failed to set deadline");
+	}
 
 	/*
 	 * Process ignores SIGTERM, so it should survive initial timeout
@@ -3461,9 +3503,18 @@ test_deadline_with_grace(void)
 	 * Total time: 300ms (initial) + 500ms (grace) = 800ms
 	 */
 	ret = waitpid_timeout(pid, &status, 1500);
-	TEST_ASSERT(ret == 0, "Process should be killed after grace period");
-	TEST_ASSERT(WIFSIGNALED(status) && WTERMSIG(status) == SIGKILL,
-	    "Process should be killed with SIGKILL");
+	if (ret != 0) {
+		pdkill(proc_fd, SIGKILL);
+		waitpid(pid, NULL, 0);
+		close(proc_fd);
+		close(coal_fd);
+		return TEST_FAIL("Process should be killed after grace period");
+	}
+	if (!(WIFSIGNALED(status) && WTERMSIG(status) == SIGKILL)) {
+		close(proc_fd);
+		close(coal_fd);
+		return TEST_FAIL("Process should be killed with SIGKILL");
+	}
 
 	close(proc_fd);
 	close(coal_fd);
@@ -3559,6 +3610,7 @@ test_watchdog_basic(void)
 	ret = ioctl(coal_fd, VBSD_COALITION_ENLIST, &proc_fd);
 	if (ret < 0) {
 		pdkill(proc_fd, SIGKILL);
+		waitpid(pid, NULL, 0);
 		close(proc_fd);
 		close(coal_fd);
 		return TEST_FAIL("Failed to enlist process");
@@ -3566,13 +3618,28 @@ test_watchdog_basic(void)
 
 	/* Enable watchdog */
 	ret = ioctl(coal_fd, VBSD_COALITION_SET_WATCHDOG, &timeout_ms);
-	TEST_ASSERT(ret == 0, "Failed to set watchdog");
+	if (ret != 0) {
+		pdkill(proc_fd, SIGKILL);
+		waitpid(pid, NULL, 0);
+		close(proc_fd);
+		close(coal_fd);
+		return TEST_FAIL("Failed to set watchdog");
+	}
 
 	/* Don't heartbeat - let it expire */
 	ret = waitpid_timeout(pid, &status, 1500);
-	TEST_ASSERT(ret == 0, "Process should be killed by watchdog");
-	TEST_ASSERT(WIFSIGNALED(status) && WTERMSIG(status) == SIGKILL,
-	    "Process should be killed with SIGKILL");
+	if (ret != 0) {
+		pdkill(proc_fd, SIGKILL);
+		waitpid(pid, NULL, 0);
+		close(proc_fd);
+		close(coal_fd);
+		return TEST_FAIL("Process should be killed by watchdog");
+	}
+	if (!(WIFSIGNALED(status) && WTERMSIG(status) == SIGKILL)) {
+		close(proc_fd);
+		close(coal_fd);
+		return TEST_FAIL("Process should be killed with SIGKILL");
+	}
 
 	close(proc_fd);
 	close(coal_fd);
@@ -3609,6 +3676,7 @@ test_watchdog_heartbeat(void)
 	ret = ioctl(coal_fd, VBSD_COALITION_ENLIST, &proc_fd);
 	if (ret < 0) {
 		pdkill(proc_fd, SIGKILL);
+		waitpid(pid, NULL, 0);
 		close(proc_fd);
 		close(coal_fd);
 		return TEST_FAIL("Failed to enlist process");
@@ -3616,22 +3684,40 @@ test_watchdog_heartbeat(void)
 
 	/* Enable watchdog */
 	ret = ioctl(coal_fd, VBSD_COALITION_SET_WATCHDOG, &timeout_ms);
-	TEST_ASSERT(ret == 0, "Failed to set watchdog");
+	if (ret != 0) {
+		pdkill(proc_fd, SIGKILL);
+		waitpid(pid, NULL, 0);
+		close(proc_fd);
+		close(coal_fd);
+		return TEST_FAIL("Failed to set watchdog");
+	}
 
 	/* Heartbeat several times, keeping watchdog from expiring */
 	for (i = 0; i < 5; i++) {
 		usleep(150000);  /* 150ms - before timeout */
 		ret = ioctl(coal_fd, VBSD_COALITION_HEARTBEAT, NULL);
-		TEST_ASSERT(ret == 0, "Heartbeat failed");
+		if (ret != 0) {
+			pdkill(proc_fd, SIGKILL);
+			waitpid(pid, NULL, 0);
+			close(proc_fd);
+			close(coal_fd);
+			return TEST_FAIL("Heartbeat failed");
+		}
 	}
 
 	/* Process should still be alive after 750ms of heartbeating */
 	ret = waitpid_timeout(pid, &status, 100);
-	TEST_ASSERT(ret == 1 && errno == ETIMEDOUT,
-	    "Process should still be alive");
+	if (!(ret == 1 && errno == ETIMEDOUT)) {
+		pdkill(proc_fd, SIGKILL);
+		waitpid(pid, NULL, 0);
+		close(proc_fd);
+		close(coal_fd);
+		return TEST_FAIL("Process should still be alive");
+	}
 
 	/* Clean up */
 	pdkill(proc_fd, SIGKILL);
+	waitpid(pid, NULL, 0);
 	close(proc_fd);
 	close(coal_fd);
 	return TEST_PASS(NULL);
@@ -3667,6 +3753,7 @@ test_watchdog_disable(void)
 	ret = ioctl(coal_fd, VBSD_COALITION_ENLIST, &proc_fd);
 	if (ret < 0) {
 		pdkill(proc_fd, SIGKILL);
+		waitpid(pid, NULL, 0);
 		close(proc_fd);
 		close(coal_fd);
 		return TEST_FAIL("Failed to enlist process");
@@ -3674,20 +3761,38 @@ test_watchdog_disable(void)
 
 	/* Enable watchdog */
 	ret = ioctl(coal_fd, VBSD_COALITION_SET_WATCHDOG, &timeout_ms);
-	TEST_ASSERT(ret == 0, "Failed to set watchdog");
+	if (ret != 0) {
+		pdkill(proc_fd, SIGKILL);
+		waitpid(pid, NULL, 0);
+		close(proc_fd);
+		close(coal_fd);
+		return TEST_FAIL("Failed to set watchdog");
+	}
 
 	/* Disable watchdog */
 	timeout_ms = 0;
 	ret = ioctl(coal_fd, VBSD_COALITION_SET_WATCHDOG, &timeout_ms);
-	TEST_ASSERT(ret == 0, "Failed to disable watchdog");
+	if (ret != 0) {
+		pdkill(proc_fd, SIGKILL);
+		waitpid(pid, NULL, 0);
+		close(proc_fd);
+		close(coal_fd);
+		return TEST_FAIL("Failed to disable watchdog");
+	}
 
 	/* Wait past original timeout - process should survive */
 	ret = waitpid_timeout(pid, &status, 600);
-	TEST_ASSERT(ret == 1 && errno == ETIMEDOUT,
-	    "Process should still be alive (watchdog disabled)");
+	if (!(ret == 1 && errno == ETIMEDOUT)) {
+		pdkill(proc_fd, SIGKILL);
+		waitpid(pid, NULL, 0);
+		close(proc_fd);
+		close(coal_fd);
+		return TEST_FAIL("Process should still be alive (watchdog disabled)");
+	}
 
 	/* Clean up */
 	pdkill(proc_fd, SIGKILL);
+	waitpid(pid, NULL, 0);
 	close(proc_fd);
 	close(coal_fd);
 	return TEST_PASS(NULL);
@@ -3809,6 +3914,8 @@ test_leader_basic(void)
 	if (ret < 0) {
 		pdkill(leader_fd, SIGKILL);
 		pdkill(worker_fd, SIGKILL);
+		waitpid(leader_pid, NULL, 0);
+		waitpid(worker_pid, NULL, 0);
 		close(leader_fd);
 		close(worker_fd);
 		close(coal_fd);
@@ -3820,6 +3927,8 @@ test_leader_basic(void)
 	if (ret < 0) {
 		pdkill(leader_fd, SIGKILL);
 		pdkill(worker_fd, SIGKILL);
+		waitpid(leader_pid, NULL, 0);
+		waitpid(worker_pid, NULL, 0);
 		close(leader_fd);
 		close(worker_fd);
 		close(coal_fd);
@@ -3829,7 +3938,17 @@ test_leader_basic(void)
 
 	/* Set leader */
 	ret = ioctl(coal_fd, VBSD_COALITION_SET_LEADER, &leader_fd);
-	TEST_ASSERT(ret == 0, "Failed to set leader");
+	if (ret != 0) {
+		pdkill(leader_fd, SIGKILL);
+		pdkill(worker_fd, SIGKILL);
+		waitpid(leader_pid, NULL, 0);
+		waitpid(worker_pid, NULL, 0);
+		close(leader_fd);
+		close(worker_fd);
+		close(coal_fd);
+		close(pipe_fds[1]);
+		return TEST_FAIL("Failed to set leader");
+	}
 
 	/* Signal leader to exit */
 	write(pipe_fds[1], "x", 1);
@@ -3837,13 +3956,33 @@ test_leader_basic(void)
 
 	/* Wait for leader to exit */
 	ret = waitpid_timeout(leader_pid, &status, 1000);
-	TEST_ASSERT(ret == 0, "Leader should exit");
+	if (ret != 0) {
+		pdkill(leader_fd, SIGKILL);
+		pdkill(worker_fd, SIGKILL);
+		waitpid(leader_pid, NULL, 0);
+		waitpid(worker_pid, NULL, 0);
+		close(leader_fd);
+		close(worker_fd);
+		close(coal_fd);
+		return TEST_FAIL("Leader should exit");
+	}
 
 	/* Worker should be killed due to leader death */
 	ret = waitpid_timeout(worker_pid, &status, 1000);
-	TEST_ASSERT(ret == 0, "Worker should be killed");
-	TEST_ASSERT(WIFSIGNALED(status) && WTERMSIG(status) == SIGKILL,
-	    "Worker should be killed with SIGKILL");
+	if (ret != 0) {
+		pdkill(worker_fd, SIGKILL);
+		waitpid(worker_pid, NULL, 0);
+		close(leader_fd);
+		close(worker_fd);
+		close(coal_fd);
+		return TEST_FAIL("Worker should be killed");
+	}
+	if (!(WIFSIGNALED(status) && WTERMSIG(status) == SIGKILL)) {
+		close(leader_fd);
+		close(worker_fd);
+		close(coal_fd);
+		return TEST_FAIL("Worker should be killed with SIGKILL");
+	}
 
 	close(leader_fd);
 	close(worker_fd);
@@ -3893,6 +4032,7 @@ test_leader_clear(void)
 	worker_pid = pdfork(&worker_fd, PD_DAEMON);
 	if (worker_pid < 0) {
 		pdkill(leader_fd, SIGKILL);
+		waitpid(leader_pid, NULL, 0);
 		close(leader_fd);
 		close(coal_fd);
 		close(pipe_fds[1]);
@@ -3910,17 +4050,57 @@ test_leader_clear(void)
 
 	/* Enlist both */
 	ret = ioctl(coal_fd, VBSD_COALITION_ENLIST, &leader_fd);
-	TEST_ASSERT(ret == 0, "Failed to enlist leader");
+	if (ret != 0) {
+		pdkill(leader_fd, SIGKILL);
+		pdkill(worker_fd, SIGKILL);
+		waitpid(leader_pid, NULL, 0);
+		waitpid(worker_pid, NULL, 0);
+		close(leader_fd);
+		close(worker_fd);
+		close(coal_fd);
+		close(pipe_fds[1]);
+		return TEST_FAIL("Failed to enlist leader");
+	}
 
 	ret = ioctl(coal_fd, VBSD_COALITION_ENLIST, &worker_fd);
-	TEST_ASSERT(ret == 0, "Failed to enlist worker");
+	if (ret != 0) {
+		pdkill(leader_fd, SIGKILL);
+		pdkill(worker_fd, SIGKILL);
+		waitpid(leader_pid, NULL, 0);
+		waitpid(worker_pid, NULL, 0);
+		close(leader_fd);
+		close(worker_fd);
+		close(coal_fd);
+		close(pipe_fds[1]);
+		return TEST_FAIL("Failed to enlist worker");
+	}
 
 	/* Set leader, then clear it */
 	ret = ioctl(coal_fd, VBSD_COALITION_SET_LEADER, &leader_fd);
-	TEST_ASSERT(ret == 0, "Failed to set leader");
+	if (ret != 0) {
+		pdkill(leader_fd, SIGKILL);
+		pdkill(worker_fd, SIGKILL);
+		waitpid(leader_pid, NULL, 0);
+		waitpid(worker_pid, NULL, 0);
+		close(leader_fd);
+		close(worker_fd);
+		close(coal_fd);
+		close(pipe_fds[1]);
+		return TEST_FAIL("Failed to set leader");
+	}
 
 	ret = ioctl(coal_fd, VBSD_COALITION_SET_LEADER, &clear_fd);
-	TEST_ASSERT(ret == 0, "Failed to clear leader");
+	if (ret != 0) {
+		pdkill(leader_fd, SIGKILL);
+		pdkill(worker_fd, SIGKILL);
+		waitpid(leader_pid, NULL, 0);
+		waitpid(worker_pid, NULL, 0);
+		close(leader_fd);
+		close(worker_fd);
+		close(coal_fd);
+		close(pipe_fds[1]);
+		return TEST_FAIL("Failed to clear leader");
+	}
 
 	/* Signal leader to exit */
 	write(pipe_fds[1], "x", 1);
@@ -3928,15 +4108,31 @@ test_leader_clear(void)
 
 	/* Wait for leader to exit */
 	ret = waitpid_timeout(leader_pid, &status, 1000);
-	TEST_ASSERT(ret == 0, "Leader should exit");
+	if (ret != 0) {
+		pdkill(leader_fd, SIGKILL);
+		pdkill(worker_fd, SIGKILL);
+		waitpid(leader_pid, NULL, 0);
+		waitpid(worker_pid, NULL, 0);
+		close(leader_fd);
+		close(worker_fd);
+		close(coal_fd);
+		return TEST_FAIL("Leader should exit");
+	}
 
 	/* Worker should still be alive (leader was cleared) */
 	ret = waitpid_timeout(worker_pid, &status, 300);
-	TEST_ASSERT(ret == 1 && errno == ETIMEDOUT,
-	    "Worker should still be alive");
+	if (!(ret == 1 && errno == ETIMEDOUT)) {
+		pdkill(worker_fd, SIGKILL);
+		waitpid(worker_pid, NULL, 0);
+		close(leader_fd);
+		close(worker_fd);
+		close(coal_fd);
+		return TEST_FAIL("Worker should still be alive");
+	}
 
 	/* Clean up */
 	pdkill(worker_fd, SIGKILL);
+	waitpid(worker_pid, NULL, 0);
 	close(leader_fd);
 	close(worker_fd);
 	close(coal_fd);
@@ -3972,11 +4168,17 @@ test_leader_not_enlisted(void)
 
 	/* Try to set as leader without enlisting */
 	ret = ioctl(coal_fd, VBSD_COALITION_SET_LEADER, &proc_fd);
-	TEST_ASSERT(ret < 0 && errno == ESRCH,
-	    "Set leader of non-enlisted process should fail ESRCH");
+	if (!(ret < 0 && errno == ESRCH)) {
+		pdkill(proc_fd, SIGKILL);
+		waitpid(pid, NULL, 0);
+		close(proc_fd);
+		close(coal_fd);
+		return TEST_FAIL("Set leader of non-enlisted process should fail ESRCH");
+	}
 
 	/* Clean up */
 	pdkill(proc_fd, SIGKILL);
+	waitpid(pid, NULL, 0);
 	close(proc_fd);
 	close(coal_fd);
 	return TEST_PASS(NULL);
@@ -3997,8 +4199,10 @@ test_leader_invalid_fd(void)
 
 	/* Try to set leader with invalid fd */
 	ret = ioctl(coal_fd, VBSD_COALITION_SET_LEADER, &bad_fd);
-	TEST_ASSERT(ret < 0 && errno == EBADF,
-	    "Set leader with bad fd should fail EBADF");
+	if (!(ret < 0 && errno == EBADF)) {
+		close(coal_fd);
+		return TEST_FAIL("Set leader with bad fd should fail EBADF");
+	}
 
 	close(coal_fd);
 	return TEST_PASS(NULL);
@@ -4012,7 +4216,7 @@ test_leader_after_terminate(void)
 {
 	int coal_fd, proc_fd;
 	pid_t pid;
-	int ret;
+	int ret, status;
 
 	coal_fd = create_coalition();
 	TEST_ASSERT(coal_fd >= 0, "Failed to create coalition");
@@ -4032,18 +4236,228 @@ test_leader_after_terminate(void)
 	}
 
 	ret = ioctl(coal_fd, VBSD_COALITION_ENLIST, &proc_fd);
-	TEST_ASSERT(ret == 0, "Failed to enlist process");
+	if (ret != 0) {
+		pdkill(proc_fd, SIGKILL);
+		waitpid(pid, NULL, 0);
+		close(proc_fd);
+		close(coal_fd);
+		return TEST_FAIL("Failed to enlist process");
+	}
 
 	/* Terminate coalition */
 	ret = ioctl(coal_fd, VBSD_COALITION_TERMINATE);
-	TEST_ASSERT(ret == 0, "Terminate should succeed");
+	if (ret != 0) {
+		/* Process should be killed by terminate attempt anyway */
+		waitpid(pid, NULL, 0);
+		close(proc_fd);
+		close(coal_fd);
+		return TEST_FAIL("Terminate should succeed");
+	}
+
+	/* Wait for process to be killed by terminate */
+	waitpid_timeout(pid, &status, 1000);
 
 	/* Try to set leader after terminate */
 	ret = ioctl(coal_fd, VBSD_COALITION_SET_LEADER, &proc_fd);
-	TEST_ASSERT(ret < 0 && errno == ESHUTDOWN,
-	    "Set leader after terminate should fail ESHUTDOWN");
+	if (!(ret < 0 && errno == ESHUTDOWN)) {
+		close(proc_fd);
+		close(coal_fd);
+		return TEST_FAIL("Set leader after terminate should fail ESHUTDOWN");
+	}
 
 	close(proc_fd);
+	close(coal_fd);
+	return TEST_PASS(NULL);
+}
+
+/*
+ * Test: Set leader with non-procdesc fd fails
+ */
+static struct test_result
+test_leader_non_procdesc(void)
+{
+	int coal_fd;
+	int sock_fd;
+	int ret;
+
+	coal_fd = create_coalition();
+	TEST_ASSERT(coal_fd >= 0, "Failed to create coalition");
+
+	/* Create a socket (not a procdesc) */
+	sock_fd = socket(AF_UNIX, SOCK_STREAM, 0);
+	if (sock_fd < 0) {
+		close(coal_fd);
+		return TEST_FAIL("socket failed");
+	}
+
+	/* Enlist the socket */
+	ret = ioctl(coal_fd, VBSD_COALITION_ENLIST, &sock_fd);
+	if (ret != 0) {
+		close(sock_fd);
+		close(coal_fd);
+		return TEST_FAIL("Failed to enlist socket");
+	}
+
+	/* Try to set socket as leader - should fail with EINVAL */
+	ret = ioctl(coal_fd, VBSD_COALITION_SET_LEADER, &sock_fd);
+	if (!(ret < 0 && errno == EINVAL)) {
+		close(sock_fd);
+		close(coal_fd);
+		return TEST_FAIL("Set non-procdesc as leader should fail EINVAL");
+	}
+
+	close(sock_fd);
+	close(coal_fd);
+	return TEST_PASS(NULL);
+}
+
+/*
+ * Test: Change leader from one process to another
+ */
+static struct test_result
+test_leader_change(void)
+{
+	int coal_fd, proc1_fd, proc2_fd;
+	pid_t pid1, pid2;
+	int ret, status;
+	int pipe_fds[2];
+
+	coal_fd = create_coalition();
+	TEST_ASSERT(coal_fd >= 0, "Failed to create coalition");
+
+	/* Create pipe for coordination */
+	ret = pipe(pipe_fds);
+	if (ret != 0) {
+		close(coal_fd);
+		return TEST_FAIL("pipe failed");
+	}
+
+	/* Create first process */
+	pid1 = pdfork(&proc1_fd, PD_DAEMON);
+	if (pid1 < 0) {
+		close(coal_fd);
+		close(pipe_fds[0]);
+		close(pipe_fds[1]);
+		return TEST_FAIL("pdfork proc1 failed");
+	}
+
+	if (pid1 == 0) {
+		char ready;
+		close(coal_fd);
+		close(pipe_fds[1]);
+		read(pipe_fds[0], &ready, 1);
+		close(pipe_fds[0]);
+		_exit(0);
+	}
+	close(pipe_fds[0]);
+
+	/* Create second process */
+	pid2 = pdfork(&proc2_fd, PD_DAEMON);
+	if (pid2 < 0) {
+		pdkill(proc1_fd, SIGKILL);
+		waitpid(pid1, NULL, 0);
+		close(proc1_fd);
+		close(coal_fd);
+		close(pipe_fds[1]);
+		return TEST_FAIL("pdfork proc2 failed");
+	}
+
+	if (pid2 == 0) {
+		close(coal_fd);
+		close(proc1_fd);
+		close(pipe_fds[1]);
+		while (1)
+			sleep(10);
+		_exit(0);
+	}
+
+	/* Enlist both */
+	ret = ioctl(coal_fd, VBSD_COALITION_ENLIST, &proc1_fd);
+	if (ret != 0) {
+		pdkill(proc1_fd, SIGKILL);
+		pdkill(proc2_fd, SIGKILL);
+		waitpid(pid1, NULL, 0);
+		waitpid(pid2, NULL, 0);
+		close(proc1_fd);
+		close(proc2_fd);
+		close(coal_fd);
+		close(pipe_fds[1]);
+		return TEST_FAIL("Failed to enlist proc1");
+	}
+
+	ret = ioctl(coal_fd, VBSD_COALITION_ENLIST, &proc2_fd);
+	if (ret != 0) {
+		pdkill(proc1_fd, SIGKILL);
+		pdkill(proc2_fd, SIGKILL);
+		waitpid(pid1, NULL, 0);
+		waitpid(pid2, NULL, 0);
+		close(proc1_fd);
+		close(proc2_fd);
+		close(coal_fd);
+		close(pipe_fds[1]);
+		return TEST_FAIL("Failed to enlist proc2");
+	}
+
+	/* Set proc1 as leader */
+	ret = ioctl(coal_fd, VBSD_COALITION_SET_LEADER, &proc1_fd);
+	if (ret != 0) {
+		pdkill(proc1_fd, SIGKILL);
+		pdkill(proc2_fd, SIGKILL);
+		waitpid(pid1, NULL, 0);
+		waitpid(pid2, NULL, 0);
+		close(proc1_fd);
+		close(proc2_fd);
+		close(coal_fd);
+		close(pipe_fds[1]);
+		return TEST_FAIL("Failed to set proc1 as leader");
+	}
+
+	/* Change leader to proc2 */
+	ret = ioctl(coal_fd, VBSD_COALITION_SET_LEADER, &proc2_fd);
+	if (ret != 0) {
+		pdkill(proc1_fd, SIGKILL);
+		pdkill(proc2_fd, SIGKILL);
+		waitpid(pid1, NULL, 0);
+		waitpid(pid2, NULL, 0);
+		close(proc1_fd);
+		close(proc2_fd);
+		close(coal_fd);
+		close(pipe_fds[1]);
+		return TEST_FAIL("Failed to change leader to proc2");
+	}
+
+	/* Kill proc1 - should NOT trigger termination since proc2 is leader now */
+	write(pipe_fds[1], "x", 1);
+	close(pipe_fds[1]);
+
+	ret = waitpid_timeout(pid1, &status, 1000);
+	if (ret != 0) {
+		pdkill(proc1_fd, SIGKILL);
+		pdkill(proc2_fd, SIGKILL);
+		waitpid(pid1, NULL, 0);
+		waitpid(pid2, NULL, 0);
+		close(proc1_fd);
+		close(proc2_fd);
+		close(coal_fd);
+		return TEST_FAIL("proc1 should exit");
+	}
+
+	/* proc2 should still be alive */
+	ret = waitpid_timeout(pid2, &status, 300);
+	if (!(ret == 1 && errno == ETIMEDOUT)) {
+		pdkill(proc2_fd, SIGKILL);
+		waitpid(pid2, NULL, 0);
+		close(proc1_fd);
+		close(proc2_fd);
+		close(coal_fd);
+		return TEST_FAIL("proc2 should still be alive");
+	}
+
+	/* Clean up */
+	pdkill(proc2_fd, SIGKILL);
+	waitpid(pid2, NULL, 0);
+	close(proc1_fd);
+	close(proc2_fd);
 	close(coal_fd);
 	return TEST_PASS(NULL);
 }
@@ -4503,6 +4917,10 @@ main(int argc __unused, char *argv[] __unused)
 	    "Set leader with invalid fd fails", test_leader_invalid_fd);
 	test_harness_register("test_leader_after_terminate",
 	    "Set leader after terminate fails", test_leader_after_terminate);
+	test_harness_register("test_leader_non_procdesc",
+	    "Set non-procdesc as leader fails", test_leader_non_procdesc);
+	test_harness_register("test_leader_change",
+	    "Change leader from A to B", test_leader_change);
 
 	/* Nested coalition tests */
 	test_harness_register("test_nested_coalition_basic",

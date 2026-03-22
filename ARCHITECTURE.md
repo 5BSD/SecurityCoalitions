@@ -661,6 +661,8 @@ SecurityCoalitions/
 | Leader not enlisted | `test_leader_not_enlisted` | ESRCH |
 | Leader invalid fd | `test_leader_invalid_fd` | EBADF |
 | Leader after terminate | `test_leader_after_terminate` | ESHUTDOWN |
+| Leader non-procdesc | `test_leader_non_procdesc` | EINVAL for socket |
+| Leader change | `test_leader_change` | A→B, A's death doesn't trigger |
 | Nested basic | `test_nested_coalition_basic` | success |
 | Nested cascade terminate | `test_nested_coalition_cascade_terminate` | all killed |
 | Nested depth tracking | `test_nested_coalition_depth` | depth correct |
