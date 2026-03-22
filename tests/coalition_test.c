@@ -3262,6 +3262,270 @@ test_graceful_invalid_signal(void)
 }
 
 /* =========================================================================
+ * DEADLINE TERMINATION TESTS
+ * ========================================================================= */
+
+/*
+ * Test: Basic deadline - process killed after timeout
+ */
+static struct test_result
+test_deadline_basic(void)
+{
+	int coal_fd, proc_fd;
+	pid_t pid;
+	struct vbsd_deadline d = {
+		.vd_timeout_ms = 500,	/* 500ms */
+		.vd_signal = 0,		/* Immediate SIGKILL */
+		.vd_grace_ms = 0,
+	};
+	int ret, status;
+
+	coal_fd = create_coalition();
+	TEST_ASSERT(coal_fd >= 0, "Failed to create coalition");
+
+	pid = pdfork(&proc_fd, PD_DAEMON);
+	if (pid < 0) {
+		close(coal_fd);
+		return TEST_FAIL("pdfork failed");
+	}
+
+	if (pid == 0) {
+		close(coal_fd);
+		/* Child: sleep forever, expect to be killed */
+		while (1)
+			sleep(10);
+		_exit(0);
+	}
+
+	/* Enlist child */
+	ret = ioctl(coal_fd, VBSD_COALITION_ENLIST, &proc_fd);
+	if (ret < 0) {
+		pdkill(proc_fd, SIGKILL);
+		close(proc_fd);
+		close(coal_fd);
+		return TEST_FAIL("Failed to enlist process");
+	}
+
+	/* Set deadline */
+	ret = ioctl(coal_fd, VBSD_COALITION_SET_DEADLINE, &d);
+	TEST_ASSERT(ret == 0, "Failed to set deadline");
+
+	/* Wait for deadline to fire (should kill process) */
+	ret = waitpid_timeout(pid, &status, 1500);
+	TEST_ASSERT(ret == 0, "Process should be killed by deadline");
+	TEST_ASSERT(WIFSIGNALED(status) && WTERMSIG(status) == SIGKILL,
+	    "Process should be killed with SIGKILL");
+
+	close(proc_fd);
+	close(coal_fd);
+	return TEST_PASS(NULL);
+}
+
+/*
+ * Test: Cancel deadline by setting timeout to 0
+ */
+static struct test_result
+test_deadline_cancel(void)
+{
+	int coal_fd, proc_fd;
+	pid_t pid;
+	struct vbsd_deadline d = {
+		.vd_timeout_ms = 500,
+		.vd_signal = 0,
+		.vd_grace_ms = 0,
+	};
+	int ret, status;
+
+	coal_fd = create_coalition();
+	TEST_ASSERT(coal_fd >= 0, "Failed to create coalition");
+
+	pid = pdfork(&proc_fd, PD_DAEMON);
+	if (pid < 0) {
+		close(coal_fd);
+		return TEST_FAIL("pdfork failed");
+	}
+
+	if (pid == 0) {
+		close(coal_fd);
+		while (1)
+			sleep(10);
+		_exit(0);
+	}
+
+	ret = ioctl(coal_fd, VBSD_COALITION_ENLIST, &proc_fd);
+	if (ret < 0) {
+		pdkill(proc_fd, SIGKILL);
+		close(proc_fd);
+		close(coal_fd);
+		return TEST_FAIL("Failed to enlist process");
+	}
+
+	/* Set deadline */
+	ret = ioctl(coal_fd, VBSD_COALITION_SET_DEADLINE, &d);
+	TEST_ASSERT(ret == 0, "Failed to set deadline");
+
+	/* Cancel deadline */
+	d.vd_timeout_ms = 0;
+	ret = ioctl(coal_fd, VBSD_COALITION_SET_DEADLINE, &d);
+	TEST_ASSERT(ret == 0, "Failed to cancel deadline");
+
+	/* Wait a bit - process should NOT be killed */
+	ret = waitpid_timeout(pid, &status, 800);
+	TEST_ASSERT(ret == 1 && errno == ETIMEDOUT,
+	    "Process should still be alive (deadline cancelled)");
+
+	/* Clean up */
+	pdkill(proc_fd, SIGKILL);
+	close(proc_fd);
+	close(coal_fd);
+	return TEST_PASS(NULL);
+}
+
+/*
+ * Test: Deadline with grace period - send SIGTERM first, then SIGKILL
+ */
+static struct test_result
+test_deadline_with_grace(void)
+{
+	int coal_fd, proc_fd;
+	pid_t pid;
+	struct vbsd_deadline d = {
+		.vd_timeout_ms = 300,	/* Initial timeout */
+		.vd_signal = SIGTERM,	/* Send SIGTERM first */
+		.vd_grace_ms = 500,	/* Then SIGKILL after grace */
+	};
+	int ret, status;
+	int pipefd[2];
+	char buf;
+
+	coal_fd = create_coalition();
+	TEST_ASSERT(coal_fd >= 0, "Failed to create coalition");
+
+	if (pipe(pipefd) < 0) {
+		close(coal_fd);
+		return TEST_FAIL("pipe failed");
+	}
+
+	pid = pdfork(&proc_fd, PD_DAEMON);
+	if (pid < 0) {
+		close(pipefd[0]);
+		close(pipefd[1]);
+		close(coal_fd);
+		return TEST_FAIL("pdfork failed");
+	}
+
+	if (pid == 0) {
+		close(coal_fd);
+		close(pipefd[0]);
+
+		/* Signal handler to catch SIGTERM and notify parent */
+		signal(SIGTERM, SIG_IGN);  /* Ignore SIGTERM - be stubborn */
+
+		/* Tell parent we're ready */
+		write(pipefd[1], "R", 1);
+		close(pipefd[1]);
+
+		/* Sleep forever - will be killed by SIGKILL */
+		while (1)
+			sleep(10);
+		_exit(0);
+	}
+
+	close(pipefd[1]);
+
+	/* Wait for child to be ready */
+	ret = read_ready_byte(pipefd[0], &buf, 2000);
+	close(pipefd[0]);
+	if (ret != 1) {
+		pdkill(proc_fd, SIGKILL);
+		close(proc_fd);
+		close(coal_fd);
+		return TEST_FAIL("Child did not signal ready");
+	}
+
+	ret = ioctl(coal_fd, VBSD_COALITION_ENLIST, &proc_fd);
+	if (ret < 0) {
+		pdkill(proc_fd, SIGKILL);
+		close(proc_fd);
+		close(coal_fd);
+		return TEST_FAIL("Failed to enlist process");
+	}
+
+	/* Set deadline with grace period */
+	ret = ioctl(coal_fd, VBSD_COALITION_SET_DEADLINE, &d);
+	TEST_ASSERT(ret == 0, "Failed to set deadline");
+
+	/*
+	 * Process ignores SIGTERM, so it should survive initial timeout
+	 * but be killed by SIGKILL after grace period.
+	 * Total time: 300ms (initial) + 500ms (grace) = 800ms
+	 */
+	ret = waitpid_timeout(pid, &status, 1500);
+	TEST_ASSERT(ret == 0, "Process should be killed after grace period");
+	TEST_ASSERT(WIFSIGNALED(status) && WTERMSIG(status) == SIGKILL,
+	    "Process should be killed with SIGKILL");
+
+	close(proc_fd);
+	close(coal_fd);
+	return TEST_PASS(NULL);
+}
+
+/*
+ * Test: Setting deadline after terminate fails with ESHUTDOWN
+ */
+static struct test_result
+test_deadline_after_terminate(void)
+{
+	int coal_fd;
+	int ret;
+	struct vbsd_deadline d = {
+		.vd_timeout_ms = 1000,
+		.vd_signal = 0,
+		.vd_grace_ms = 0,
+	};
+
+	coal_fd = create_coalition();
+	TEST_ASSERT(coal_fd >= 0, "Failed to create coalition");
+
+	/* Terminate first */
+	ret = ioctl(coal_fd, VBSD_COALITION_TERMINATE);
+	TEST_ASSERT(ret == 0, "Terminate should succeed");
+
+	/* Try to set deadline */
+	ret = ioctl(coal_fd, VBSD_COALITION_SET_DEADLINE, &d);
+	TEST_ASSERT(ret < 0 && errno == ESHUTDOWN,
+	    "Set deadline after terminate should fail ESHUTDOWN");
+
+	close(coal_fd);
+	return TEST_PASS(NULL);
+}
+
+/*
+ * Test: Deadline with invalid signal fails
+ */
+static struct test_result
+test_deadline_invalid_signal(void)
+{
+	int coal_fd;
+	int ret;
+	struct vbsd_deadline d = {
+		.vd_timeout_ms = 1000,
+		.vd_signal = -1,	/* Invalid signal */
+		.vd_grace_ms = 100,
+	};
+
+	coal_fd = create_coalition();
+	TEST_ASSERT(coal_fd >= 0, "Failed to create coalition");
+
+	ret = ioctl(coal_fd, VBSD_COALITION_SET_DEADLINE, &d);
+	TEST_ASSERT(ret < 0 && errno == EINVAL,
+	    "Invalid signal should return EINVAL");
+
+	close(coal_fd);
+	return TEST_PASS(NULL);
+}
+
+/* =========================================================================
  * NESTED COALITION TESTS
  * ========================================================================= */
 
@@ -3680,6 +3944,18 @@ main(int argc __unused, char *argv[] __unused)
 	    "Stubborn process gets SIGKILL", test_graceful_stubborn_process);
 	test_harness_register("test_graceful_invalid_signal",
 	    "Graceful with invalid signal fails", test_graceful_invalid_signal);
+
+	/* Deadline termination tests */
+	test_harness_register("test_deadline_basic",
+	    "Process killed after timeout", test_deadline_basic);
+	test_harness_register("test_deadline_cancel",
+	    "Deadline cancelled with timeout=0", test_deadline_cancel);
+	test_harness_register("test_deadline_with_grace",
+	    "Deadline with grace period", test_deadline_with_grace);
+	test_harness_register("test_deadline_after_terminate",
+	    "Set deadline after terminate fails", test_deadline_after_terminate);
+	test_harness_register("test_deadline_invalid_signal",
+	    "Deadline with invalid signal fails", test_deadline_invalid_signal);
 
 	/* Nested coalition tests */
 	test_harness_register("test_nested_coalition_basic",

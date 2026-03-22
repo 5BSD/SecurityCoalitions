@@ -125,6 +125,7 @@
 #define VBSD_COALITION_STAT		_IOR('V', 5, struct vbsd_coalition_stat)
 #define VBSD_COALITION_SET_SIGNAL	_IOW('V', 6, int)
 #define VBSD_COALITION_TERMINATE_GRACEFUL _IOW('V', 7, struct vbsd_graceful)
+#define VBSD_COALITION_SET_DEADLINE	_IOW('V', 8, struct vbsd_deadline)
 
 /*
  * Batch enlistment structure.
@@ -202,6 +203,32 @@ struct vbsd_graceful {
 	u_int		vg_timeout_ms;	/* Grace period in milliseconds */
 };
 
+/*
+ * Deadline termination parameters.
+ *
+ * Automatically terminate the coalition after a timeout. Useful for
+ * batch jobs, serverless functions, or untrusted code with hard time limits.
+ *
+ * If vd_signal is non-zero, that signal is sent first, followed by
+ * SIGKILL after vd_grace_ms. If vd_signal is 0, immediate SIGKILL.
+ *
+ * Setting vd_timeout_ms to 0 cancels any pending deadline.
+ * Setting a new deadline replaces any existing one.
+ *
+ * Example:
+ *   struct vbsd_deadline d = {
+ *       .vd_timeout_ms = 30000,   // 30 seconds
+ *       .vd_signal = SIGTERM,     // Try graceful first
+ *       .vd_grace_ms = 5000,      // 5 second grace period
+ *   };
+ *   ioctl(coal_fd, VBSD_COALITION_SET_DEADLINE, &d);
+ */
+struct vbsd_deadline {
+	uint32_t	vd_timeout_ms;	/* Time until termination (0 = cancel) */
+	int		vd_signal;	/* Signal before SIGKILL (0 = immediate) */
+	uint32_t	vd_grace_ms;	/* Grace period after signal */
+};
+
 /* Maximum nesting depth to prevent infinite loops */
 #define VBSD_MAX_NESTING_DEPTH	16
 
@@ -212,6 +239,8 @@ struct vbsd_graceful {
 #include <sys/sx.h>
 #include <sys/proc.h>
 #include <sys/file.h>
+#include <sys/callout.h>
+#include <sys/taskqueue.h>
 
 /* ========================================================================
  * Public API for External Modules
@@ -299,7 +328,9 @@ vbsd_coalition_available(void)
 
 struct prison;
 
-#define VCF_TERMINATING	0x0001
+#define VCF_TERMINATING		0x0001
+#define VCF_DEADLINE_ACTIVE	0x0002	/* Deadline timer is running */
+#define VCF_DEADLINE_GRACE	0x0004	/* In grace period after initial signal */
 
 /*
  * Lock order: vbsd_proc_hash_lock -> vc_sx
@@ -312,6 +343,12 @@ struct vbsd_coalition {
 	u_int				vc_nesting_depth; /* Depth when nested */
 	volatile u_int			vc_member_count;
 	u_int				vc_refcount;
+
+	/* Deadline termination */
+	struct callout			vc_deadline_callout;
+	struct task			vc_deadline_task;
+	int				vc_deadline_signal;  /* Signal before SIGKILL */
+	uint32_t			vc_deadline_grace_ms; /* Grace period */
 };
 
 /*

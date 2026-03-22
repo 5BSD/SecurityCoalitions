@@ -40,6 +40,7 @@
 #include <sys/socketvar.h>
 #include <sys/sdt.h>
 #include <sys/syscall.h>
+#include <sys/taskqueue.h>
 
 #include <security/audit/audit.h>
 
@@ -270,6 +271,8 @@ static fo_stat_t	vbsd_coalition_fo_stat;
 static void		vbsd_coalition_terminate_members_locked(
 			    struct vbsd_coalition *vc, struct thread *td,
 			    bool skip_self);
+static void		vbsd_deadline_callout(void *arg);
+static void		vbsd_deadline_task_fn(void *context, int pending);
 
 /* ========================================================================
  * Sysctl Interface and Resource Limits
@@ -633,6 +636,8 @@ vbsd_coalition_alloc(void)
 	vc->vc_signal = SIGKILL;	/* Default to immediate termination */
 	vc->vc_nesting_depth = 0;
 	vc->vc_flags = 0;
+	callout_init(&vc->vc_deadline_callout, 1);  /* MPSAFE */
+	TASK_INIT(&vc->vc_deadline_task, 0, vbsd_deadline_task_fn, vc);
 	refcount_init(&vc->vc_refcount, 1);
 	atomic_add_int(&vbsd_coalition_count, 1);
 
@@ -664,6 +669,101 @@ vbsd_coalition_rel(struct vbsd_coalition *vc)
 {
 	if (refcount_release(&vc->vc_refcount))
 		vbsd_coalition_free(vc);
+}
+
+/* ========================================================================
+ * Deadline Termination
+ * ======================================================================== */
+
+/*
+ * Task function for deadline termination.
+ * Runs in thread context (can sleep), performs the actual termination.
+ */
+static void
+vbsd_deadline_task_fn(void *context, int pending __unused)
+{
+	struct vbsd_coalition *vc = context;
+	struct thread *td = curthread;
+
+	sx_xlock(&vc->vc_sx);
+
+	/*
+	 * Check if coalition was already terminated or deadline cancelled.
+	 * If so, just release our reference and return.
+	 */
+	if ((vc->vc_flags & VCF_TERMINATING) ||
+	    !(vc->vc_flags & VCF_DEADLINE_ACTIVE)) {
+		sx_xunlock(&vc->vc_sx);
+		vbsd_coalition_rel(vc);  /* Release task's reference */
+		return;
+	}
+
+	/*
+	 * If we're in grace period, this is the final SIGKILL phase.
+	 * Otherwise, this is the initial signal phase.
+	 */
+	if (vc->vc_flags & VCF_DEADLINE_GRACE) {
+		/* Grace period expired - do full termination with SIGKILL */
+		vc->vc_flags &= ~(VCF_DEADLINE_ACTIVE | VCF_DEADLINE_GRACE);
+		vbsd_coalition_terminate_members_locked(vc, td, false);
+	} else if (vc->vc_deadline_signal != 0 &&
+		   vc->vc_deadline_grace_ms > 0) {
+		/*
+		 * Initial deadline hit - send configured signal and
+		 * schedule grace period callout for SIGKILL.
+		 */
+		struct vbsd_member *vm;
+		int sig = vc->vc_deadline_signal;
+
+		TAILQ_FOREACH(vm, &vc->vc_members, vm_link) {
+			if (vm->vm_dtype == DTYPE_PROCDESC && vm->vm_fp != NULL) {
+				struct procdesc *pd = vm->vm_fp->f_data;
+				struct proc *p;
+
+				sx_slock(&proctree_lock);
+				p = pd->pd_proc;
+				if (p != NULL) {
+					PROC_LOCK(p);
+					sx_sunlock(&proctree_lock);
+					kern_psignal(p, sig);
+					PROC_UNLOCK(p);
+				} else {
+					sx_sunlock(&proctree_lock);
+				}
+			}
+		}
+
+		/* Schedule grace period timeout */
+		vc->vc_flags |= VCF_DEADLINE_GRACE;
+		vbsd_coalition_ref(vc);  /* Reference for next callout */
+		callout_reset(&vc->vc_deadline_callout,
+		    vc->vc_deadline_grace_ms * hz / 1000,
+		    vbsd_deadline_callout, vc);
+	} else {
+		/* No grace period - immediate termination */
+		vc->vc_flags &= ~VCF_DEADLINE_ACTIVE;
+		vbsd_coalition_terminate_members_locked(vc, td, false);
+	}
+
+	sx_xunlock(&vc->vc_sx);
+	vbsd_coalition_rel(vc);  /* Release task's reference */
+}
+
+/*
+ * Callout function for deadline termination.
+ * Runs in softirq context (cannot sleep), schedules task for actual work.
+ */
+static void
+vbsd_deadline_callout(void *arg)
+{
+	struct vbsd_coalition *vc = arg;
+
+	/*
+	 * Enqueue task to do the actual termination work.
+	 * The task will release our reference when done.
+	 * Reference was taken when callout was scheduled.
+	 */
+	taskqueue_enqueue(taskqueue_thread, &vc->vc_deadline_task);
 }
 
 static int
@@ -1899,6 +1999,73 @@ vbsd_coalition_fo_ioctl(struct file *fp, u_long cmd, void *data,
 		}
 		break;
 
+	case VBSD_COALITION_SET_DEADLINE:
+		{
+			struct vbsd_deadline *d = data;
+
+			sx_xlock(&vc->vc_sx);
+
+			if (vc->vc_flags & VCF_TERMINATING) {
+				sx_xunlock(&vc->vc_sx);
+				error = ESHUTDOWN;
+				break;
+			}
+
+			/*
+			 * Cancel any existing deadline first.
+			 * callout_stop returns true if the callout was pending.
+			 */
+			if (vc->vc_flags & VCF_DEADLINE_ACTIVE) {
+				vc->vc_flags &= ~(VCF_DEADLINE_ACTIVE |
+				    VCF_DEADLINE_GRACE);
+				if (callout_stop(&vc->vc_deadline_callout)) {
+					/*
+					 * Callout was pending, release the
+					 * reference it held.
+					 */
+					vbsd_coalition_rel(vc);
+				}
+				/*
+				 * Note: if callout already fired and task is
+				 * pending, task will see DEADLINE_ACTIVE cleared
+				 * and release its reference without terminating.
+				 */
+			}
+
+			if (d->vd_timeout_ms == 0) {
+				/* Just cancel, don't set new deadline */
+				sx_xunlock(&vc->vc_sx);
+				error = 0;
+				break;
+			}
+
+			/* Validate signal if specified */
+			if (d->vd_signal != 0 &&
+			    (d->vd_signal < 0 || d->vd_signal >= NSIG)) {
+				sx_xunlock(&vc->vc_sx);
+				error = EINVAL;
+				break;
+			}
+
+			/* Set up new deadline */
+			vc->vc_deadline_signal = d->vd_signal;
+			vc->vc_deadline_grace_ms = d->vd_grace_ms;
+			vc->vc_flags |= VCF_DEADLINE_ACTIVE;
+			vc->vc_flags &= ~VCF_DEADLINE_GRACE;
+
+			/* Take reference for callout */
+			vbsd_coalition_ref(vc);
+
+			/* Schedule the deadline callout */
+			callout_reset(&vc->vc_deadline_callout,
+			    d->vd_timeout_ms * hz / 1000,
+			    vbsd_deadline_callout, vc);
+
+			sx_xunlock(&vc->vc_sx);
+			error = 0;
+		}
+		break;
+
 	default:
 		error = ENOTTY;
 		break;
@@ -1927,11 +2094,28 @@ vbsd_coalition_fo_close(struct file *fp, struct thread *td)
 	}
 	KASSERT(vc != NULL, ("vbsd_coalition_fo_close: NULL vc"));
 
+	/*
+	 * Drain any pending deadline callout/task before acquiring vc_sx.
+	 * This prevents deadlock since the task also acquires vc_sx.
+	 * We drain unconditionally because checking flags without lock is racy.
+	 */
+	callout_drain(&vc->vc_deadline_callout);
+	taskqueue_drain(taskqueue_thread, &vc->vc_deadline_task);
+
 	member_count = atomic_load_acq_int(&vc->vc_member_count);
 	SDT_PROBE1(coalition, , , close, member_count);
 	(void)member_count;
 
 	sx_xlock(&vc->vc_sx);
+
+	/*
+	 * If deadline was active, release the reference that was held for
+	 * the callout/task. The drain above ensures nothing is running.
+	 */
+	if (vc->vc_flags & VCF_DEADLINE_ACTIVE) {
+		vc->vc_flags &= ~(VCF_DEADLINE_ACTIVE | VCF_DEADLINE_GRACE);
+		vbsd_coalition_rel(vc);
+	}
 	vbsd_coalition_terminate_members_locked(vc, td, true);
 
 	/*

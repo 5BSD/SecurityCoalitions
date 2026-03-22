@@ -132,6 +132,18 @@ ioctl(coalition_fd, VBSD_COALITION_TERMINATE_GRACEFUL, &g);
 /* Immediate terminate (SIGKILL) */
 ioctl(coalition_fd, VBSD_COALITION_TERMINATE);
 
+/* Set deadline - automatic termination after timeout */
+struct vbsd_deadline d = {
+    .vd_timeout_ms = 30000,   /* 30 seconds */
+    .vd_signal = SIGTERM,     /* Try graceful first */
+    .vd_grace_ms = 5000,      /* 5 second grace period */
+};
+ioctl(coalition_fd, VBSD_COALITION_SET_DEADLINE, &d);
+
+/* Cancel deadline (timeout = 0) */
+d.vd_timeout_ms = 0;
+ioctl(coalition_fd, VBSD_COALITION_SET_DEADLINE, &d);
+
 /* Or just close - also terminates all members */
 close(coalition_fd);
 ```
@@ -436,6 +448,35 @@ ioctl(coalition_fd, VBSD_COALITION_TERMINATE_GRACEFUL, &g);
 are terminated. Processes that don't exit during the grace period are
 forcefully killed.
 
+## Deadline Termination
+
+Automatically terminate the coalition after a timeout. Useful for batch jobs,
+serverless functions, or sandboxing untrusted code with hard time limits.
+
+```c
+struct vbsd_deadline d = {
+    .vd_timeout_ms = 30000,   /* 30 seconds until termination */
+    .vd_signal = SIGTERM,     /* Signal to send first (0 = immediate SIGKILL) */
+    .vd_grace_ms = 5000,      /* Grace period after signal before SIGKILL */
+};
+ioctl(coalition_fd, VBSD_COALITION_SET_DEADLINE, &d);
+```
+
+**Behavior**:
+1. After `vd_timeout_ms`, send `vd_signal` to all process members
+2. Wait `vd_grace_ms` for processes to exit voluntarily
+3. Send SIGKILL to any remaining processes
+4. Terminate all other members (jails, sockets, etc.)
+
+**Cancellation**: Set `vd_timeout_ms = 0` to cancel a pending deadline.
+
+**Resetting**: Setting a new deadline replaces any existing one.
+
+**Use cases**:
+- Batch job timeout: "Kill everything if job takes > 1 hour"
+- Sandbox timeout: "WebAssembly module gets 30 seconds max"
+- Serverless function timeout: "Lambda must complete in 15 minutes"
+
 ## Project Structure
 
 ```
@@ -526,6 +567,11 @@ SecurityCoalitions/
 | Graceful process exits | `test_graceful_process_exits` | SIGTERM kill |
 | Graceful stubborn | `test_graceful_stubborn_process` | SIGKILL after timeout |
 | Graceful invalid signal | `test_graceful_invalid_signal` | EINVAL |
+| Deadline basic | `test_deadline_basic` | process killed after timeout |
+| Deadline cancel | `test_deadline_cancel` | process survives cancelled deadline |
+| Deadline with grace | `test_deadline_with_grace` | SIGTERM then SIGKILL |
+| Deadline after terminate | `test_deadline_after_terminate` | ESHUTDOWN |
+| Deadline invalid signal | `test_deadline_invalid_signal` | EINVAL |
 | Nested basic | `test_nested_coalition_basic` | success |
 | Nested cascade terminate | `test_nested_coalition_cascade_terminate` | all killed |
 | Nested depth tracking | `test_nested_coalition_depth` | depth correct |
