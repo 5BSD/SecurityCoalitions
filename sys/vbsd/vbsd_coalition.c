@@ -47,6 +47,8 @@
 #include <machine/atomic.h>
 
 #include <vm/uma.h>
+#include <sys/resourcevar.h>
+#include <sys/user.h>
 
 #include "vbsd_coalition.h"
 
@@ -279,6 +281,7 @@ static void		vbsd_deadline_callout(void *arg);
 static void		vbsd_deadline_task_fn(void *context, int pending);
 static void		vbsd_watchdog_callout(void *arg);
 static void		vbsd_watchdog_task_fn(void *context, int pending);
+static int		vbsd_coalition_terminate(struct vbsd_coalition *vc);
 
 /* ========================================================================
  * Sysctl Interface and Resource Limits
@@ -1005,6 +1008,7 @@ vbsd_jail_osd_dtor(void *value)
 		int dtype = vm->vm_dtype;
 		struct thread *td = curthread;
 		bool in_tailq;
+		bool was_leader = false;
 
 		KASSERT(td != NULL, ("vbsd_jail_osd_dtor: NULL curthread"));
 		KASSERT((td->td_pflags & TDP_ITHREAD) == 0,
@@ -1019,8 +1023,24 @@ vbsd_jail_osd_dtor(void *value)
 		if (in_tailq) {
 			TAILQ_REMOVE(&vc->vc_members, vm, vm_link);
 			vm->vm_link.tqe_prev = NULL;  /* Mark as removed */
+
+			/* Check if this was the leader */
+			if ((vc->vc_flags & VCF_HAS_LEADER) &&
+			    vc->vc_leader == vm) {
+				was_leader = true;
+				vc->vc_leader = NULL;
+			}
 		}
 		sx_xunlock(&vc->vc_sx);
+
+		/*
+		 * If this jail was the leader, trigger coalition termination.
+		 * Must be done before cleanup to ensure coalition is still valid.
+		 */
+		if (was_leader) {
+			SDT_PROBE1(coalition, , , leader__exit, 0);
+			vbsd_coalition_terminate(vc);
+		}
 
 		/*
 		 * If we removed from TAILQ, we own the cleanup.
@@ -1529,6 +1549,40 @@ vbsd_coalition_terminate(struct vbsd_coalition *vc)
 
 	if (jail_fps != NULL)
 		free(jail_fps, M_VBSD_COALITION);
+
+	/*
+	 * If this coalition is a leader in a parent coalition, notify the
+	 * parent to terminate as well. This implements the "leader death
+	 * trigger" for nested coalitions.
+	 *
+	 * Note: We do this after terminating our own members to avoid
+	 * potential deadlocks from recursive termination.
+	 */
+	sx_slock(&vc->vc_sx);
+	if (vc->vc_leader_of != NULL) {
+		struct vbsd_member *parent_vm = vc->vc_leader_of;
+		struct vbsd_coalition *parent_vc = parent_vm->vm_coalition;
+
+		vc->vc_leader_of = NULL;  /* Clear back-pointer */
+		sx_sunlock(&vc->vc_sx);
+
+		if (parent_vc != NULL) {
+			sx_xlock(&parent_vc->vc_sx);
+			if ((parent_vc->vc_flags & VCF_HAS_LEADER) &&
+			    parent_vc->vc_leader == parent_vm &&
+			    !(parent_vc->vc_flags & VCF_TERMINATING)) {
+				parent_vc->vc_leader = NULL;
+				sx_xunlock(&parent_vc->vc_sx);
+
+				SDT_PROBE1(coalition, , , leader__exit, 0);
+				vbsd_coalition_terminate(parent_vc);
+			} else {
+				sx_xunlock(&parent_vc->vc_sx);
+			}
+		}
+	} else {
+		sx_sunlock(&vc->vc_sx);
+	}
 
 	return (0);
 }
@@ -2207,9 +2261,6 @@ vbsd_coalition_fo_ioctl(struct file *fp, u_long cmd, void *data,
 			int target_fd;
 			struct file *target_fp;
 			struct vbsd_member *vm;
-			struct procdesc *pd;
-			struct proc *p;
-			pid_t pid;
 
 			target_fd = *(int *)data;
 
@@ -2223,6 +2274,27 @@ vbsd_coalition_fo_ioctl(struct file *fp, u_long cmd, void *data,
 
 			/* Clear leader if fd is -1 */
 			if (target_fd == -1) {
+				/*
+				 * If old leader was a coalition, clear its
+				 * back-pointer.
+				 */
+				if (vc->vc_leader != NULL &&
+				    vc->vc_leader->vm_ops == &vbsd_coalition_ops &&
+				    vc->vc_leader->vm_fp != NULL) {
+					struct vbsd_coalition_file *old_vcf;
+					struct vbsd_coalition *old_child;
+
+					old_vcf = vc->vc_leader->vm_fp->f_data;
+					if (old_vcf != NULL &&
+					    old_vcf->vcf_coalition != NULL) {
+						old_child = old_vcf->vcf_coalition;
+						sx_xlock(&old_child->vc_sx);
+						old_child->vc_leader_of = NULL;
+						sx_xunlock(&old_child->vc_sx);
+					}
+				}
+
+				vc->vc_leader = NULL;
 				vc->vc_leader_pid = 0;
 				vc->vc_flags &= ~VCF_HAS_LEADER;
 				sx_xunlock(&vc->vc_sx);
@@ -2237,18 +2309,12 @@ vbsd_coalition_fo_ioctl(struct file *fp, u_long cmd, void *data,
 				break;
 			}
 
-			/* Must be a process descriptor */
-			if (target_fp->f_type != DTYPE_PROCDESC) {
-				fdrop(target_fp, td);
-				sx_xunlock(&vc->vc_sx);
-				error = EINVAL;
-				break;
-			}
-
-			/* Find this fd in our member list */
+			/*
+			 * Find this fd in our member list.
+			 * Leader can be a process, jail, or nested coalition.
+			 */
 			TAILQ_FOREACH(vm, &vc->vc_members, vm_link) {
-				if (vm->vm_fp == target_fp &&
-				    vm->vm_ops == &vbsd_proc_ops)
+				if (vm->vm_fp == target_fp)
 					break;
 			}
 
@@ -2260,25 +2326,320 @@ vbsd_coalition_fo_ioctl(struct file *fp, u_long cmd, void *data,
 				break;
 			}
 
-			/* Get the process and its pid */
-			pd = target_fp->f_data;
-			sx_slock(&proctree_lock);
-			p = pd->pd_proc;
-			if (p == NULL || (p->p_flag & P_WEXIT)) {
+			/*
+			 * Validate the member type and extract tracking info.
+			 * - Processes: track pid for exit handler
+			 * - Jails: track member pointer (OSD destructor handles it)
+			 * - Coalitions: track member pointer (terminate callback)
+			 */
+			if (vm->vm_ops == &vbsd_proc_ops) {
+				struct procdesc *pd;
+				struct proc *p;
+				pid_t pid;
+
+				pd = target_fp->f_data;
+				sx_slock(&proctree_lock);
+				p = pd->pd_proc;
+				if (p == NULL || (p->p_flag & P_WEXIT)) {
+					sx_sunlock(&proctree_lock);
+					fdrop(target_fp, td);
+					sx_xunlock(&vc->vc_sx);
+					error = ESRCH;
+					break;
+				}
+				pid = p->p_pid;
 				sx_sunlock(&proctree_lock);
+
+				vc->vc_leader = vm;
+				vc->vc_leader_pid = pid;
+				vc->vc_flags |= VCF_HAS_LEADER;
+			} else if (vm->vm_ops == &vbsd_jail_ops) {
+				/* Jail leader - OSD destructor will trigger */
+				vc->vc_leader = vm;
+				vc->vc_leader_pid = 0;
+				vc->vc_flags |= VCF_HAS_LEADER;
+			} else if (vm->vm_ops == &vbsd_coalition_ops) {
+				/* Nested coalition leader */
+				struct vbsd_coalition_file *child_vcf;
+				struct vbsd_coalition *child_vc;
+
+				child_vcf = target_fp->f_data;
+				if (child_vcf == NULL ||
+				    child_vcf->vcf_coalition == NULL) {
+					fdrop(target_fp, td);
+					sx_xunlock(&vc->vc_sx);
+					error = EINVAL;
+					break;
+				}
+				child_vc = child_vcf->vcf_coalition;
+
+				/*
+				 * Set back-pointer so child can notify us
+				 * when it terminates.
+				 */
+				sx_xlock(&child_vc->vc_sx);
+				child_vc->vc_leader_of = vm;
+				sx_xunlock(&child_vc->vc_sx);
+
+				vc->vc_leader = vm;
+				vc->vc_leader_pid = 0;
+				vc->vc_flags |= VCF_HAS_LEADER;
+			} else {
+				/*
+				 * Other types (sockets, shm, etc.) don't have
+				 * a meaningful "death" concept.
+				 */
 				fdrop(target_fp, td);
 				sx_xunlock(&vc->vc_sx);
-				error = ESRCH;
+				error = EINVAL;
 				break;
 			}
-			pid = p->p_pid;
-			sx_sunlock(&proctree_lock);
-
-			vc->vc_leader_pid = pid;
-			vc->vc_flags |= VCF_HAS_LEADER;
 
 			fdrop(target_fp, td);
 			sx_xunlock(&vc->vc_sx);
+			error = 0;
+		}
+		break;
+
+	case VBSD_COALITION_RUSAGE:
+		{
+			struct vbsd_coalition_rusage *ru;
+			struct vbsd_member *vm;
+			struct vbsd_proc_data *vpd;
+			struct proc *p;
+			struct kinfo_proc kp;
+
+			ru = (struct vbsd_coalition_rusage *)data;
+			memset(ru, 0, sizeof(*ru));
+
+			sx_slock(&vc->vc_sx);
+
+			TAILQ_FOREACH(vm, &vc->vc_members, vm_link) {
+				/*
+				 * Handle direct process members
+				 */
+				if (vm->vm_ops == &vbsd_proc_ops) {
+					/*
+					 * Get the proc pointer. For enlisted processes,
+					 * use the procdesc. For self-joined, use vpd.
+					 */
+					p = NULL;
+					if (vm->vm_fp != NULL) {
+						struct procdesc *pd = vm->vm_fp->f_data;
+						if (pd != NULL)
+							p = pd->pd_proc;
+					} else if (vm->vm_data != NULL) {
+						vpd = vm->vm_data;
+						p = (struct proc *)atomic_load_acq_ptr(
+						    (uintptr_t *)&vpd->vpd_proc);
+					}
+
+					if (p == NULL)
+						continue;
+
+					/* Skip zombies and exiting processes */
+					PROC_LOCK(p);
+					if (p->p_state == PRS_ZOMBIE ||
+					    (p->p_flag & P_WEXIT)) {
+						PROC_UNLOCK(p);
+						continue;
+					}
+
+					fill_kinfo_proc(p, &kp);
+					PROC_UNLOCK(p);
+
+					ru->vcr_nprocs++;
+					ru->vcr_nthreads += kp.ki_numthreads;
+					ru->vcr_rss_bytes +=
+					    (uint64_t)kp.ki_rssize * PAGE_SIZE;
+					ru->vcr_vsz_bytes += kp.ki_size;
+					ru->vcr_user_usec +=
+					    (uint64_t)kp.ki_rusage.ru_utime.tv_sec *
+					    1000000 + kp.ki_rusage.ru_utime.tv_usec;
+					ru->vcr_sys_usec +=
+					    (uint64_t)kp.ki_rusage.ru_stime.tv_sec *
+					    1000000 + kp.ki_rusage.ru_stime.tv_usec;
+					ru->vcr_inblock += kp.ki_rusage.ru_inblock;
+					ru->vcr_oublock += kp.ki_rusage.ru_oublock;
+					ru->vcr_majflt += kp.ki_rusage.ru_majflt;
+					ru->vcr_minflt += kp.ki_rusage.ru_minflt;
+					continue;
+				}
+
+				/*
+				 * Handle jail members - aggregate all processes
+				 * running inside the jail.
+				 */
+				if (vm->vm_ops == &vbsd_jail_ops &&
+				    vm->vm_fp != NULL) {
+					struct jaildesc *jd;
+					struct prison *pr;
+
+					jd = vm->vm_fp->f_data;
+					if (jd == NULL)
+						continue;
+
+					JAILDESC_LOCK(jd);
+					pr = jd->jd_prison;
+					if (pr == NULL || !prison_isvalid(pr)) {
+						JAILDESC_UNLOCK(jd);
+						continue;
+					}
+					prison_hold(pr);
+					JAILDESC_UNLOCK(jd);
+
+					/*
+					 * Iterate all processes, aggregate those
+					 * in this jail (or its descendants).
+					 */
+					sx_slock(&allproc_lock);
+					FOREACH_PROC_IN_SYSTEM(p) {
+						PROC_LOCK(p);
+						if (p->p_state == PRS_ZOMBIE ||
+						    (p->p_flag & P_WEXIT) ||
+						    p->p_ucred == NULL) {
+							PROC_UNLOCK(p);
+							continue;
+						}
+
+						/*
+						 * Check if process is in this jail
+						 * or a descendant jail.
+						 */
+						if (!prison_ischild(pr,
+						    p->p_ucred->cr_prison)) {
+							PROC_UNLOCK(p);
+							continue;
+						}
+
+						fill_kinfo_proc(p, &kp);
+						PROC_UNLOCK(p);
+
+						ru->vcr_nprocs++;
+						ru->vcr_nthreads += kp.ki_numthreads;
+						ru->vcr_rss_bytes +=
+						    (uint64_t)kp.ki_rssize * PAGE_SIZE;
+						ru->vcr_vsz_bytes += kp.ki_size;
+						ru->vcr_user_usec +=
+						    (uint64_t)kp.ki_rusage.ru_utime.tv_sec *
+						    1000000 + kp.ki_rusage.ru_utime.tv_usec;
+						ru->vcr_sys_usec +=
+						    (uint64_t)kp.ki_rusage.ru_stime.tv_sec *
+						    1000000 + kp.ki_rusage.ru_stime.tv_usec;
+						ru->vcr_inblock += kp.ki_rusage.ru_inblock;
+						ru->vcr_oublock += kp.ki_rusage.ru_oublock;
+						ru->vcr_majflt += kp.ki_rusage.ru_majflt;
+						ru->vcr_minflt += kp.ki_rusage.ru_minflt;
+					}
+					sx_sunlock(&allproc_lock);
+					prison_free(pr);
+					continue;
+				}
+
+				/*
+				 * Handle nested coalition members - recursively
+				 * aggregate stats from child coalition.
+				 * Note: vc_sx is held as slock, child coalition
+				 * will also take its own sx as slock.
+				 */
+				if (vm->vm_ops == &vbsd_coalition_ops &&
+				    vm->vm_fp != NULL &&
+				    vbsd_is_coalition(vm->vm_fp)) {
+					struct vbsd_coalition_file *child_vcf;
+					struct vbsd_coalition *child_vc;
+					struct vbsd_coalition_rusage child_ru;
+					struct vbsd_member *child_vm;
+
+					child_vcf = vm->vm_fp->f_data;
+					if (child_vcf == NULL)
+						continue;
+					child_vc = child_vcf->vcf_coalition;
+					if (child_vc == NULL)
+						continue;
+
+					/*
+					 * Aggregate child's process members.
+					 * Don't recurse further to avoid stack
+					 * overflow; only handle direct processes.
+					 */
+					memset(&child_ru, 0, sizeof(child_ru));
+					sx_slock(&child_vc->vc_sx);
+
+					TAILQ_FOREACH(child_vm,
+					    &child_vc->vc_members, vm_link) {
+						if (child_vm->vm_ops !=
+						    &vbsd_proc_ops)
+							continue;
+
+						p = NULL;
+						if (child_vm->vm_fp != NULL) {
+							struct procdesc *pd;
+							pd = child_vm->vm_fp->f_data;
+							if (pd != NULL)
+								p = pd->pd_proc;
+						} else if (child_vm->vm_data != NULL) {
+							vpd = child_vm->vm_data;
+							p = (struct proc *)
+							    atomic_load_acq_ptr(
+							    (uintptr_t *)&vpd->vpd_proc);
+						}
+
+						if (p == NULL)
+							continue;
+
+						PROC_LOCK(p);
+						if (p->p_state == PRS_ZOMBIE ||
+						    (p->p_flag & P_WEXIT)) {
+							PROC_UNLOCK(p);
+							continue;
+						}
+
+						fill_kinfo_proc(p, &kp);
+						PROC_UNLOCK(p);
+
+						child_ru.vcr_nprocs++;
+						child_ru.vcr_nthreads +=
+						    kp.ki_numthreads;
+						child_ru.vcr_rss_bytes +=
+						    (uint64_t)kp.ki_rssize *
+						    PAGE_SIZE;
+						child_ru.vcr_vsz_bytes +=
+						    kp.ki_size;
+						child_ru.vcr_user_usec +=
+						    (uint64_t)kp.ki_rusage.
+						    ru_utime.tv_sec * 1000000 +
+						    kp.ki_rusage.ru_utime.tv_usec;
+						child_ru.vcr_sys_usec +=
+						    (uint64_t)kp.ki_rusage.
+						    ru_stime.tv_sec * 1000000 +
+						    kp.ki_rusage.ru_stime.tv_usec;
+						child_ru.vcr_inblock +=
+						    kp.ki_rusage.ru_inblock;
+						child_ru.vcr_oublock +=
+						    kp.ki_rusage.ru_oublock;
+						child_ru.vcr_majflt +=
+						    kp.ki_rusage.ru_majflt;
+						child_ru.vcr_minflt +=
+						    kp.ki_rusage.ru_minflt;
+					}
+					sx_sunlock(&child_vc->vc_sx);
+
+					/* Merge child stats into parent */
+					ru->vcr_nprocs += child_ru.vcr_nprocs;
+					ru->vcr_nthreads += child_ru.vcr_nthreads;
+					ru->vcr_rss_bytes += child_ru.vcr_rss_bytes;
+					ru->vcr_vsz_bytes += child_ru.vcr_vsz_bytes;
+					ru->vcr_user_usec += child_ru.vcr_user_usec;
+					ru->vcr_sys_usec += child_ru.vcr_sys_usec;
+					ru->vcr_inblock += child_ru.vcr_inblock;
+					ru->vcr_oublock += child_ru.vcr_oublock;
+					ru->vcr_majflt += child_ru.vcr_majflt;
+					ru->vcr_minflt += child_ru.vcr_minflt;
+					continue;
+				}
+			}
+
+			sx_sunlock(&vc->vc_sx);
 			error = 0;
 		}
 		break;

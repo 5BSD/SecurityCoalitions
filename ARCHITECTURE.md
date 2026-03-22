@@ -527,26 +527,37 @@ ioctl(coalition_fd, VBSD_COALITION_SET_WATCHDOG, &timeout_ms);
 
 ## Leader Death Trigger
 
-Designate a "leader" process. If it exits for any reason, the entire coalition
-is terminated immediately.
+Designate a "leader" member. If it dies (process exits, jail destroyed, or
+nested coalition terminates), the entire coalition is terminated immediately.
 
 ```c
 /* Set a process as leader - its death triggers termination */
 ioctl(coalition_fd, VBSD_COALITION_SET_LEADER, &proc_fd);
 
-/* Clear leader (no automatic termination on any process death) */
+/* Set a jail as leader - jail destruction triggers termination */
+ioctl(coalition_fd, VBSD_COALITION_SET_LEADER, &jail_fd);
+
+/* Set nested coalition as leader - its termination triggers parent */
+ioctl(coalition_fd, VBSD_COALITION_SET_LEADER, &child_coalition_fd);
+
+/* Clear leader (no automatic termination on any member death) */
 int no_leader = -1;
 ioctl(coalition_fd, VBSD_COALITION_SET_LEADER, &no_leader);
 ```
 
+**Supported leader types**:
+- Process (procdesc): triggers on process exit
+- Jail (jaildesc): triggers on jail destruction
+- Coalition: triggers when nested coalition terminates
+
 **Requirements**:
-- The process must be enlisted in the coalition (ESRCH if not)
-- The fd must be a valid procdesc (EINVAL if not, EBADF if invalid)
+- The member must be enlisted in the coalition (ESRCH if not)
+- The fd must be a process, jail, or coalition (EINVAL for other types)
 - Cannot set leader on a terminated coalition (ESHUTDOWN)
 
 **Behavior**:
-1. When the leader process exits (normally or via signal), the exit handler
-   detects this and calls `vbsd_coalition_terminate()`
+1. When the leader dies (process exits, jail destroyed, coalition terminates),
+   the handler detects this and calls `vbsd_coalition_terminate()`
 2. All other enlisted processes receive SIGKILL
 3. All enlisted jails are removed
 4. The coalition is marked as terminated
@@ -555,6 +566,47 @@ ioctl(coalition_fd, VBSD_COALITION_SET_LEADER, &no_leader);
 - Main process: "If main() exits, kill all helper processes"
 - Session leader: "If shell exits, kill all background jobs"
 - Container init: "If PID 1 dies, tear down the container"
+- Service group: "If master jail dies, kill all slave jails"
+- Hierarchical: "If child coalition fails, tear down parent"
+
+## Resource Usage Monitoring
+
+Get aggregate resource statistics for all process members:
+
+```c
+struct vbsd_coalition_rusage ru;
+if (ioctl(coalition_fd, VBSD_COALITION_RUSAGE, &ru) == 0) {
+    printf("processes: %u, threads: %u\n",
+        ru.vcr_nprocs, ru.vcr_nthreads);
+    printf("memory: %lu KB resident, %lu KB virtual\n",
+        ru.vcr_rss_bytes / 1024, ru.vcr_vsz_bytes / 1024);
+    printf("cpu: %lu.%03lu user, %lu.%03lu sys\n",
+        ru.vcr_user_usec / 1000000, (ru.vcr_user_usec / 1000) % 1000,
+        ru.vcr_sys_usec / 1000000, (ru.vcr_sys_usec / 1000) % 1000);
+}
+```
+
+**Fields**:
+- `vcr_nprocs`: Number of live process members
+- `vcr_nthreads`: Total threads across all processes
+- `vcr_rss_bytes`: Aggregate resident set size (physical memory)
+- `vcr_vsz_bytes`: Aggregate virtual size
+- `vcr_user_usec`: Total user CPU time (microseconds)
+- `vcr_sys_usec`: Total system CPU time (microseconds)
+- `vcr_inblock`: Total block input operations
+- `vcr_oublock`: Total block output operations
+- `vcr_majflt`: Total major (disk) page faults
+- `vcr_minflt`: Total minor (reclaim) page faults
+
+**Aggregation scope**:
+- Direct process members
+- Processes running inside enlisted jails
+- Processes in nested coalitions (one level deep)
+
+**Use cases**:
+- Resource monitoring: track coalition memory/CPU usage
+- Quota enforcement: check if coalition exceeds limits
+- Billing: measure resource consumption for accounting
 
 ## Project Structure
 
@@ -663,6 +715,13 @@ SecurityCoalitions/
 | Leader after terminate | `test_leader_after_terminate` | ESHUTDOWN |
 | Leader non-procdesc | `test_leader_non_procdesc` | EINVAL for socket |
 | Leader change | `test_leader_change` | A→B, A's death doesn't trigger |
+| Leader coalition | `test_leader_coalition` | child terminate triggers parent |
+| Leader coalition clear | `test_leader_coalition_clear` | clearing breaks link |
+| Rusage empty | `test_rusage_empty_coalition` | all fields zero |
+| Rusage with process | `test_rusage_with_process` | stats non-zero |
+| Rusage multiple | `test_rusage_multiple_processes` | aggregated stats |
+| Rusage after exit | `test_rusage_after_process_exit` | 0 procs after exit |
+| Rusage after terminate | `test_rusage_after_terminate` | still works |
 | Nested basic | `test_nested_coalition_basic` | success |
 | Nested cascade terminate | `test_nested_coalition_cascade_terminate` | all killed |
 | Nested depth tracking | `test_nested_coalition_depth` | depth correct |

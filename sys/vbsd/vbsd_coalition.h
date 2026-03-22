@@ -118,17 +118,113 @@
  *   - Query status of enlisted resources
  *   - Maintain a separate handle for cleanup verification
  */
+/*
+ * ============================================================================
+ * IOCTL COMMANDS
+ * ============================================================================
+ */
+
+/* Enlist a single fd into the coalition */
 #define VBSD_COALITION_ENLIST		_IOW('V', 1, int)
+
+/* Join current process (self-enlistment without procdesc) */
 #define VBSD_COALITION_JOIN		_IO('V', 2)
+
+/* Terminate coalition immediately - all members killed/closed */
 #define VBSD_COALITION_TERMINATE	_IO('V', 3)
+
+/* Batch enlist multiple fds */
 #define VBSD_COALITION_ENLIST_SET	_IOWR('V', 4, struct vbsd_enlist_set)
+
+/* Get coalition statistics */
 #define VBSD_COALITION_STAT		_IOR('V', 5, struct vbsd_coalition_stat)
+
+/* Set termination signal (default SIGKILL) */
 #define VBSD_COALITION_SET_SIGNAL	_IOW('V', 6, int)
+
+/* Graceful terminate: signal first, then SIGKILL after timeout */
 #define VBSD_COALITION_TERMINATE_GRACEFUL _IOW('V', 7, struct vbsd_graceful)
+
+/* Set deadline: auto-terminate after timeout */
 #define VBSD_COALITION_SET_DEADLINE	_IOW('V', 8, struct vbsd_deadline)
+
+/* Set watchdog: requires periodic heartbeats or auto-terminate */
 #define VBSD_COALITION_SET_WATCHDOG	_IOW('V', 9, uint32_t)
+
+/* Reset watchdog timer (send heartbeat) */
 #define VBSD_COALITION_HEARTBEAT	_IO('V', 10)
+
+/* Set leader: member whose death triggers termination (-1 to clear) */
 #define VBSD_COALITION_SET_LEADER	_IOW('V', 11, int)
+
+/* Get aggregate resource usage of all process members */
+#define VBSD_COALITION_RUSAGE		_IOR('V', 12, struct vbsd_coalition_rusage)
+
+/*
+ * ============================================================================
+ * MEMBER TYPE CAPABILITIES
+ * ============================================================================
+ *
+ * Different member types have different behaviors when terminated or used
+ * as leaders. This matrix shows what each type supports:
+ *
+ * Member Type      | Enlist | Terminate Action      | Leader | RUSAGE
+ * -----------------|--------|----------------------|--------|--------
+ * Process          | Yes    | SIGKILL              | Yes    | Yes
+ * Jail             | Yes    | prison_remove()      | Yes    | Yes (all procs in jail)
+ * Coalition        | Yes    | Cascade terminate    | Yes    | Yes (1 level deep)
+ * Socket           | Yes    | shutdown(SHUT_RDWR)  | No     | No
+ * SHM              | Yes    | ftruncate(0)         | No     | No
+ * Pipe/FIFO        | Yes    | close only           | No     | No
+ * Vnode/Device     | Yes    | close only           | No     | No
+ * Kqueue/Eventfd   | Yes    | close only           | No     | No
+ * Semaphore        | Yes    | close only           | No     | No
+ *
+ * Leader capability:
+ *   - Process: triggers on process exit (any reason)
+ *   - Jail: triggers on jail destruction (jail -r, prison_remove)
+ *   - Coalition: triggers when nested coalition terminates
+ *   - Others: EINVAL when attempting to set as leader
+ *
+ * RUSAGE aggregation:
+ *   - Processes: direct stats via fill_kinfo_proc()
+ *   - Jails: iterates allproc, sums stats for processes in jail
+ *   - Coalitions: sums process member stats (non-recursive)
+ *   - Others: no resource stats (not processes)
+ */
+
+/*
+ * ============================================================================
+ * TERMINATE API
+ * ============================================================================
+ *
+ * Immediately terminate the coalition and all its members.
+ *
+ * Example:
+ *   ioctl(coal_fd, VBSD_COALITION_TERMINATE);
+ *
+ * Termination actions by member type:
+ *   - Processes: receive configured signal (default SIGKILL)
+ *   - Jails: prison_remove() called (all jail processes killed)
+ *   - Coalitions: recursive termination (cascade)
+ *   - Sockets: shutdown(SHUT_RDWR)
+ *   - SHM: ftruncate(0) - mappings receive SIGBUS
+ *   - Others: file reference dropped (close)
+ *
+ * The coalition is marked as terminating; further enlistments fail with
+ * ESHUTDOWN. The coalition fd remains valid until closed.
+ *
+ * Alternative termination methods:
+ *   - VBSD_COALITION_TERMINATE_GRACEFUL: signal first, SIGKILL after timeout
+ *   - SET_DEADLINE: auto-terminate after timeout
+ *   - SET_WATCHDOG: auto-terminate if heartbeats stop
+ *   - SET_LEADER: auto-terminate when leader dies
+ *   - close(coal_fd): terminates when last reference closes
+ *
+ * Returns:
+ *   0         - success
+ *   ESHUTDOWN - already terminated (not an error, idempotent)
+ */
 
 /*
  * Batch enlistment structure.
@@ -230,6 +326,89 @@ struct vbsd_deadline {
 	uint32_t	vd_timeout_ms;	/* Time until termination (0 = cancel) */
 	int		vd_signal;	/* Signal before SIGKILL (0 = immediate) */
 	uint32_t	vd_grace_ms;	/* Grace period after signal */
+};
+
+/*
+ * ============================================================================
+ * SET_LEADER API
+ * ============================================================================
+ *
+ * Designate a "leader" member. When the leader dies, the entire coalition
+ * is terminated automatically. This implements supervisor patterns.
+ *
+ * Supported leader types:
+ *   - Process (DTYPE_PROCDESC): triggers on process exit
+ *   - Jail (DTYPE_JAILDESC): triggers on jail destruction
+ *   - Coalition: triggers when nested coalition terminates
+ *
+ * Example - Process leader:
+ *   // Enlist process, then set as leader
+ *   ioctl(coal_fd, VBSD_COALITION_ENLIST, &proc_fd);
+ *   ioctl(coal_fd, VBSD_COALITION_SET_LEADER, &proc_fd);
+ *   // If process exits, coalition terminates
+ *
+ * Example - Jail leader:
+ *   ioctl(coal_fd, VBSD_COALITION_ENLIST, &jail_fd);
+ *   ioctl(coal_fd, VBSD_COALITION_SET_LEADER, &jail_fd);
+ *   // If jail -r or jail destroyed, coalition terminates
+ *
+ * Example - Coalition leader:
+ *   ioctl(parent_fd, VBSD_COALITION_ENLIST, &child_fd);
+ *   ioctl(parent_fd, VBSD_COALITION_SET_LEADER, &child_fd);
+ *   // If child coalition terminates, parent terminates too
+ *
+ * Example - Clear leader:
+ *   int no_leader = -1;
+ *   ioctl(coal_fd, VBSD_COALITION_SET_LEADER, &no_leader);
+ *
+ * Errors:
+ *   ESRCH     - fd not enlisted in this coalition
+ *   EINVAL    - fd is not a valid leader type (socket, pipe, etc.)
+ *   EBADF     - invalid file descriptor
+ *   ESHUTDOWN - coalition already terminated
+ */
+
+/*
+ * Coalition resource usage.
+ *
+ * Aggregated resource statistics across all process members.
+ * Only counts live processes (not exited ones still in member list).
+ *
+ * Example:
+ *   struct vbsd_coalition_rusage ru;
+ *   if (ioctl(coal_fd, VBSD_COALITION_RUSAGE, &ru) == 0) {
+ *       printf("processes: %u, threads: %u\n",
+ *           ru.vcr_nprocs, ru.vcr_nthreads);
+ *       printf("memory: %lu KB resident, %lu KB virtual\n",
+ *           ru.vcr_rss_bytes / 1024, ru.vcr_vsz_bytes / 1024);
+ *       printf("cpu: %lu.%03lu user, %lu.%03lu sys\n",
+ *           ru.vcr_user_usec / 1000000, (ru.vcr_user_usec / 1000) % 1000,
+ *           ru.vcr_sys_usec / 1000000, (ru.vcr_sys_usec / 1000) % 1000);
+ *   }
+ */
+struct vbsd_coalition_rusage {
+	/* Process counts */
+	uint32_t	vcr_nprocs;	/* Live process members */
+	uint32_t	vcr_nthreads;	/* Total threads across processes */
+
+	/* Memory (bytes) */
+	uint64_t	vcr_rss_bytes;	/* Resident set size (physical) */
+	uint64_t	vcr_vsz_bytes;	/* Virtual size */
+
+	/* CPU time (microseconds) */
+	uint64_t	vcr_user_usec;	/* User CPU time */
+	uint64_t	vcr_sys_usec;	/* System CPU time */
+
+	/* I/O */
+	uint64_t	vcr_inblock;	/* Block input operations */
+	uint64_t	vcr_oublock;	/* Block output operations */
+
+	/* Page faults */
+	uint64_t	vcr_majflt;	/* Major (disk) page faults */
+	uint64_t	vcr_minflt;	/* Minor (reclaim) page faults */
+
+	/* Reserved for future use */
+	uint64_t	vcr_spare[4];
 };
 
 /* Maximum nesting depth to prevent infinite loops */
@@ -361,7 +540,14 @@ struct vbsd_coalition {
 	uint32_t			vc_watchdog_timeout_ms;
 
 	/* Leader death trigger */
-	pid_t				vc_leader_pid;	/* Leader process PID (0 = none) */
+	struct vbsd_member		*vc_leader;	/* Leader member (NULL = none) */
+	pid_t				vc_leader_pid;	/* Leader PID (for process leaders) */
+
+	/*
+	 * Back-pointer when this coalition is a leader in a parent.
+	 * Used by nested coalitions to notify parent on termination.
+	 */
+	struct vbsd_member		*vc_leader_of;	/* Member in parent (NULL = none) */
 };
 
 /*

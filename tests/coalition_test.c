@@ -2996,6 +2996,339 @@ test_stat_after_terminate(void)
 }
 
 /* =========================================================================
+ * RUSAGE IOCTL TESTS
+ * ========================================================================= */
+
+/*
+ * Test: Rusage on empty coalition returns zeros
+ */
+static struct test_result
+test_rusage_empty_coalition(void)
+{
+	int coal_fd;
+	struct vbsd_coalition_rusage ru;
+
+	coal_fd = create_coalition();
+	TEST_ASSERT(coal_fd >= 0, "Failed to create coalition");
+
+	TEST_ASSERT(ioctl(coal_fd, VBSD_COALITION_RUSAGE, &ru) == 0,
+	    "RUSAGE ioctl failed");
+
+	TEST_ASSERT(ru.vcr_nprocs == 0, "Empty coalition should have 0 processes");
+	TEST_ASSERT(ru.vcr_nthreads == 0, "Empty coalition should have 0 threads");
+	TEST_ASSERT(ru.vcr_rss_bytes == 0, "Empty coalition should have 0 RSS");
+	TEST_ASSERT(ru.vcr_vsz_bytes == 0, "Empty coalition should have 0 VSZ");
+
+	close(coal_fd);
+	return TEST_PASS(NULL);
+}
+
+/*
+ * Test: Rusage with enlisted process shows non-zero values
+ */
+static struct test_result
+test_rusage_with_process(void)
+{
+	int coal_fd, proc_fd;
+	pid_t pid;
+	struct vbsd_coalition_rusage ru;
+	volatile char *mem;
+
+	coal_fd = create_coalition();
+	TEST_ASSERT(coal_fd >= 0, "Failed to create coalition");
+
+	pid = pdfork(&proc_fd, 0);
+	if (pid < 0) {
+		close(coal_fd);
+		return TEST_FAIL("pdfork failed");
+	}
+	if (pid == 0) {
+		/* Child: allocate memory and do some work */
+		close(coal_fd);
+		mem = malloc(1024 * 1024);  /* 1MB */
+		if (mem) {
+			/* Touch pages to ensure RSS */
+			for (int i = 0; i < 1024 * 1024; i += 4096) {
+				mem[i] = 'x';
+			}
+		}
+		/* Burn some CPU */
+		for (volatile int i = 0; i < 1000000; i++);
+		pause();
+		_exit(0);
+	}
+
+	/* Parent: let child run a bit */
+	usleep(50000);
+
+	if (ioctl(coal_fd, VBSD_COALITION_ENLIST, &proc_fd) != 0) {
+		pdkill(proc_fd, SIGKILL);
+		waitpid(pid, NULL, 0);
+		close(proc_fd);
+		close(coal_fd);
+		return TEST_FAIL("Enlist failed");
+	}
+
+	if (ioctl(coal_fd, VBSD_COALITION_RUSAGE, &ru) != 0) {
+		pdkill(proc_fd, SIGKILL);
+		waitpid(pid, NULL, 0);
+		close(proc_fd);
+		close(coal_fd);
+		return TEST_FAIL("RUSAGE ioctl failed");
+	}
+
+	/* Verify we got process stats */
+	if (ru.vcr_nprocs != 1) {
+		pdkill(proc_fd, SIGKILL);
+		waitpid(pid, NULL, 0);
+		close(proc_fd);
+		close(coal_fd);
+		return TEST_FAIL("Should have 1 process");
+	}
+
+	if (ru.vcr_nthreads < 1) {
+		pdkill(proc_fd, SIGKILL);
+		waitpid(pid, NULL, 0);
+		close(proc_fd);
+		close(coal_fd);
+		return TEST_FAIL("Should have at least 1 thread");
+	}
+
+	/* Memory should be non-zero for a running process */
+	if (ru.vcr_vsz_bytes == 0) {
+		pdkill(proc_fd, SIGKILL);
+		waitpid(pid, NULL, 0);
+		close(proc_fd);
+		close(coal_fd);
+		return TEST_FAIL("VSZ should be non-zero");
+	}
+
+	/* RSS should be non-zero after touching memory */
+	if (ru.vcr_rss_bytes == 0) {
+		pdkill(proc_fd, SIGKILL);
+		waitpid(pid, NULL, 0);
+		close(proc_fd);
+		close(coal_fd);
+		return TEST_FAIL("RSS should be non-zero");
+	}
+
+	pdkill(proc_fd, SIGKILL);
+	waitpid(pid, NULL, 0);
+	close(proc_fd);
+	close(coal_fd);
+	return TEST_PASS(NULL);
+}
+
+/*
+ * Test: Rusage aggregates multiple processes
+ */
+static struct test_result
+test_rusage_multiple_processes(void)
+{
+	int coal_fd, proc_fd1, proc_fd2;
+	pid_t pid1, pid2;
+	struct vbsd_coalition_rusage ru;
+
+	coal_fd = create_coalition();
+	TEST_ASSERT(coal_fd >= 0, "Failed to create coalition");
+
+	/* Create first process */
+	pid1 = pdfork(&proc_fd1, 0);
+	if (pid1 < 0) {
+		close(coal_fd);
+		return TEST_FAIL("pdfork 1 failed");
+	}
+	if (pid1 == 0) {
+		close(coal_fd);
+		pause();
+		_exit(0);
+	}
+
+	/* Create second process */
+	pid2 = pdfork(&proc_fd2, 0);
+	if (pid2 < 0) {
+		pdkill(proc_fd1, SIGKILL);
+		waitpid(pid1, NULL, 0);
+		close(proc_fd1);
+		close(coal_fd);
+		return TEST_FAIL("pdfork 2 failed");
+	}
+	if (pid2 == 0) {
+		close(coal_fd);
+		close(proc_fd1);
+		pause();
+		_exit(0);
+	}
+
+	/* Enlist both */
+	if (ioctl(coal_fd, VBSD_COALITION_ENLIST, &proc_fd1) != 0) {
+		pdkill(proc_fd1, SIGKILL);
+		waitpid(pid1, NULL, 0);
+		pdkill(proc_fd2, SIGKILL);
+		waitpid(pid2, NULL, 0);
+		close(proc_fd1);
+		close(proc_fd2);
+		close(coal_fd);
+		return TEST_FAIL("Enlist 1 failed");
+	}
+
+	if (ioctl(coal_fd, VBSD_COALITION_ENLIST, &proc_fd2) != 0) {
+		pdkill(proc_fd1, SIGKILL);
+		waitpid(pid1, NULL, 0);
+		pdkill(proc_fd2, SIGKILL);
+		waitpid(pid2, NULL, 0);
+		close(proc_fd1);
+		close(proc_fd2);
+		close(coal_fd);
+		return TEST_FAIL("Enlist 2 failed");
+	}
+
+	if (ioctl(coal_fd, VBSD_COALITION_RUSAGE, &ru) != 0) {
+		pdkill(proc_fd1, SIGKILL);
+		waitpid(pid1, NULL, 0);
+		pdkill(proc_fd2, SIGKILL);
+		waitpid(pid2, NULL, 0);
+		close(proc_fd1);
+		close(proc_fd2);
+		close(coal_fd);
+		return TEST_FAIL("RUSAGE ioctl failed");
+	}
+
+	/* Should count both processes */
+	if (ru.vcr_nprocs != 2) {
+		pdkill(proc_fd1, SIGKILL);
+		waitpid(pid1, NULL, 0);
+		pdkill(proc_fd2, SIGKILL);
+		waitpid(pid2, NULL, 0);
+		close(proc_fd1);
+		close(proc_fd2);
+		close(coal_fd);
+		return TEST_FAIL("Should have 2 processes");
+	}
+
+	/* At least 2 threads (one per process) */
+	if (ru.vcr_nthreads < 2) {
+		pdkill(proc_fd1, SIGKILL);
+		waitpid(pid1, NULL, 0);
+		pdkill(proc_fd2, SIGKILL);
+		waitpid(pid2, NULL, 0);
+		close(proc_fd1);
+		close(proc_fd2);
+		close(coal_fd);
+		return TEST_FAIL("Should have at least 2 threads");
+	}
+
+	pdkill(proc_fd1, SIGKILL);
+	waitpid(pid1, NULL, 0);
+	pdkill(proc_fd2, SIGKILL);
+	waitpid(pid2, NULL, 0);
+	close(proc_fd1);
+	close(proc_fd2);
+	close(coal_fd);
+	return TEST_PASS(NULL);
+}
+
+/*
+ * Test: Rusage after process exit shows reduced count
+ */
+static struct test_result
+test_rusage_after_process_exit(void)
+{
+	int coal_fd, proc_fd;
+	pid_t pid;
+	struct vbsd_coalition_rusage ru;
+
+	coal_fd = create_coalition();
+	TEST_ASSERT(coal_fd >= 0, "Failed to create coalition");
+
+	pid = pdfork(&proc_fd, 0);
+	if (pid < 0) {
+		close(coal_fd);
+		return TEST_FAIL("pdfork failed");
+	}
+	if (pid == 0) {
+		close(coal_fd);
+		pause();
+		_exit(0);
+	}
+
+	if (ioctl(coal_fd, VBSD_COALITION_ENLIST, &proc_fd) != 0) {
+		pdkill(proc_fd, SIGKILL);
+		waitpid(pid, NULL, 0);
+		close(proc_fd);
+		close(coal_fd);
+		return TEST_FAIL("Enlist failed");
+	}
+
+	/* Verify 1 process before */
+	if (ioctl(coal_fd, VBSD_COALITION_RUSAGE, &ru) != 0) {
+		pdkill(proc_fd, SIGKILL);
+		waitpid(pid, NULL, 0);
+		close(proc_fd);
+		close(coal_fd);
+		return TEST_FAIL("RUSAGE ioctl failed");
+	}
+
+	if (ru.vcr_nprocs != 1) {
+		pdkill(proc_fd, SIGKILL);
+		waitpid(pid, NULL, 0);
+		close(proc_fd);
+		close(coal_fd);
+		return TEST_FAIL("Should have 1 process before exit");
+	}
+
+	/* Kill the process */
+	pdkill(proc_fd, SIGKILL);
+	waitpid(pid, NULL, 0);
+
+	/* Give kernel time to process exit */
+	usleep(50000);
+
+	/* Now rusage should show 0 processes */
+	if (ioctl(coal_fd, VBSD_COALITION_RUSAGE, &ru) != 0) {
+		close(proc_fd);
+		close(coal_fd);
+		return TEST_FAIL("RUSAGE after exit failed");
+	}
+
+	if (ru.vcr_nprocs != 0) {
+		close(proc_fd);
+		close(coal_fd);
+		return TEST_FAIL("Should have 0 processes after exit");
+	}
+
+	close(proc_fd);
+	close(coal_fd);
+	return TEST_PASS(NULL);
+}
+
+/*
+ * Test: Rusage works after terminate (counts remaining processes)
+ */
+static struct test_result
+test_rusage_after_terminate(void)
+{
+	int coal_fd;
+	struct vbsd_coalition_rusage ru;
+
+	coal_fd = create_coalition();
+	TEST_ASSERT(coal_fd >= 0, "Failed to create coalition");
+
+	/* Terminate empty coalition */
+	TEST_ASSERT(ioctl(coal_fd, VBSD_COALITION_TERMINATE) == 0,
+	    "Terminate failed");
+
+	/* RUSAGE should still work */
+	TEST_ASSERT(ioctl(coal_fd, VBSD_COALITION_RUSAGE, &ru) == 0,
+	    "RUSAGE after terminate should work");
+
+	TEST_ASSERT(ru.vcr_nprocs == 0, "Should have 0 processes");
+
+	close(coal_fd);
+	return TEST_PASS(NULL);
+}
+
+/* =========================================================================
  * SET_SIGNAL IOCTL TESTS
  * ========================================================================= */
 
@@ -4462,6 +4795,305 @@ test_leader_change(void)
 	return TEST_PASS(NULL);
 }
 
+/*
+ * Test: Coalition as leader - when child coalition terminates, parent does too
+ */
+static struct test_result
+test_leader_coalition(void)
+{
+	int parent_fd, child_fd, proc_fd, worker_fd;
+	pid_t pid, worker_pid;
+	int ret, status;
+	struct vbsd_coalition_stat st;
+
+	parent_fd = create_coalition();
+	TEST_ASSERT(parent_fd >= 0, "Failed to create parent coalition");
+
+	child_fd = create_coalition();
+	if (child_fd < 0) {
+		close(parent_fd);
+		return TEST_FAIL("Failed to create child coalition");
+	}
+
+	/* Create a process in child coalition */
+	pid = pdfork(&proc_fd, PD_DAEMON);
+	if (pid < 0) {
+		close(parent_fd);
+		close(child_fd);
+		return TEST_FAIL("pdfork failed");
+	}
+	if (pid == 0) {
+		close(parent_fd);
+		close(child_fd);
+		while (1)
+			sleep(10);
+		_exit(0);
+	}
+
+	/* Create a worker in parent coalition */
+	worker_pid = pdfork(&worker_fd, PD_DAEMON);
+	if (worker_pid < 0) {
+		pdkill(proc_fd, SIGKILL);
+		waitpid(pid, NULL, 0);
+		close(proc_fd);
+		close(parent_fd);
+		close(child_fd);
+		return TEST_FAIL("pdfork worker failed");
+	}
+	if (worker_pid == 0) {
+		close(parent_fd);
+		close(child_fd);
+		close(proc_fd);
+		while (1)
+			sleep(10);
+		_exit(0);
+	}
+
+	/* Enlist process in child */
+	ret = ioctl(child_fd, VBSD_COALITION_ENLIST, &proc_fd);
+	if (ret != 0) {
+		pdkill(proc_fd, SIGKILL);
+		pdkill(worker_fd, SIGKILL);
+		waitpid(pid, NULL, 0);
+		waitpid(worker_pid, NULL, 0);
+		close(proc_fd);
+		close(worker_fd);
+		close(parent_fd);
+		close(child_fd);
+		return TEST_FAIL("Enlist in child failed");
+	}
+
+	/* Enlist worker in parent */
+	ret = ioctl(parent_fd, VBSD_COALITION_ENLIST, &worker_fd);
+	if (ret != 0) {
+		pdkill(proc_fd, SIGKILL);
+		pdkill(worker_fd, SIGKILL);
+		waitpid(pid, NULL, 0);
+		waitpid(worker_pid, NULL, 0);
+		close(proc_fd);
+		close(worker_fd);
+		close(parent_fd);
+		close(child_fd);
+		return TEST_FAIL("Enlist worker in parent failed");
+	}
+
+	/* Enlist child coalition in parent */
+	ret = ioctl(parent_fd, VBSD_COALITION_ENLIST, &child_fd);
+	if (ret != 0) {
+		pdkill(proc_fd, SIGKILL);
+		pdkill(worker_fd, SIGKILL);
+		waitpid(pid, NULL, 0);
+		waitpid(worker_pid, NULL, 0);
+		close(proc_fd);
+		close(worker_fd);
+		close(parent_fd);
+		close(child_fd);
+		return TEST_FAIL("Enlist child in parent failed");
+	}
+
+	/* Set child coalition as leader of parent */
+	ret = ioctl(parent_fd, VBSD_COALITION_SET_LEADER, &child_fd);
+	if (ret != 0) {
+		pdkill(proc_fd, SIGKILL);
+		pdkill(worker_fd, SIGKILL);
+		waitpid(pid, NULL, 0);
+		waitpid(worker_pid, NULL, 0);
+		close(proc_fd);
+		close(worker_fd);
+		close(parent_fd);
+		close(child_fd);
+		return TEST_FAIL("Set child as leader failed");
+	}
+
+	/* Terminate the child coalition */
+	ret = ioctl(child_fd, VBSD_COALITION_TERMINATE);
+	if (ret != 0) {
+		pdkill(proc_fd, SIGKILL);
+		pdkill(worker_fd, SIGKILL);
+		waitpid(pid, NULL, 0);
+		waitpid(worker_pid, NULL, 0);
+		close(proc_fd);
+		close(worker_fd);
+		close(parent_fd);
+		close(child_fd);
+		return TEST_FAIL("Terminate child failed");
+	}
+
+	/* Give time for cascade */
+	usleep(100000);
+
+	/* Parent should now be terminating */
+	ret = ioctl(parent_fd, VBSD_COALITION_STAT, &st);
+	if (ret != 0) {
+		pdkill(worker_fd, SIGKILL);
+		waitpid(worker_pid, NULL, 0);
+		close(proc_fd);
+		close(worker_fd);
+		close(parent_fd);
+		close(child_fd);
+		return TEST_FAIL("STAT on parent failed");
+	}
+
+	if (!(st.vcs_flags & VBSD_STAT_TERMINATING)) {
+		pdkill(worker_fd, SIGKILL);
+		waitpid(worker_pid, NULL, 0);
+		close(proc_fd);
+		close(worker_fd);
+		close(parent_fd);
+		close(child_fd);
+		return TEST_FAIL("Parent should be terminating");
+	}
+
+	/* Worker should be killed */
+	ret = waitpid_timeout(worker_pid, &status, 500);
+	if (ret == 1 && errno == ETIMEDOUT) {
+		pdkill(worker_fd, SIGKILL);
+		waitpid(worker_pid, NULL, 0);
+	}
+
+	/* Process in child should also be killed */
+	ret = waitpid_timeout(pid, &status, 500);
+	if (ret == 1 && errno == ETIMEDOUT) {
+		pdkill(proc_fd, SIGKILL);
+		waitpid(pid, NULL, 0);
+	}
+
+	close(proc_fd);
+	close(worker_fd);
+	close(parent_fd);
+	close(child_fd);
+	return TEST_PASS(NULL);
+}
+
+/*
+ * Test: Clearing coalition leader breaks the link
+ */
+static struct test_result
+test_leader_coalition_clear(void)
+{
+	int parent_fd, child_fd, worker_fd;
+	pid_t worker_pid;
+	int ret, status;
+	struct vbsd_coalition_stat st;
+	int clear_fd = -1;
+
+	parent_fd = create_coalition();
+	TEST_ASSERT(parent_fd >= 0, "Failed to create parent coalition");
+
+	child_fd = create_coalition();
+	if (child_fd < 0) {
+		close(parent_fd);
+		return TEST_FAIL("Failed to create child coalition");
+	}
+
+	/* Create a worker in parent coalition */
+	worker_pid = pdfork(&worker_fd, PD_DAEMON);
+	if (worker_pid < 0) {
+		close(parent_fd);
+		close(child_fd);
+		return TEST_FAIL("pdfork worker failed");
+	}
+	if (worker_pid == 0) {
+		close(parent_fd);
+		close(child_fd);
+		while (1)
+			sleep(10);
+		_exit(0);
+	}
+
+	/* Enlist worker and child in parent */
+	ret = ioctl(parent_fd, VBSD_COALITION_ENLIST, &worker_fd);
+	if (ret != 0) {
+		pdkill(worker_fd, SIGKILL);
+		waitpid(worker_pid, NULL, 0);
+		close(worker_fd);
+		close(parent_fd);
+		close(child_fd);
+		return TEST_FAIL("Enlist worker failed");
+	}
+
+	ret = ioctl(parent_fd, VBSD_COALITION_ENLIST, &child_fd);
+	if (ret != 0) {
+		pdkill(worker_fd, SIGKILL);
+		waitpid(worker_pid, NULL, 0);
+		close(worker_fd);
+		close(parent_fd);
+		close(child_fd);
+		return TEST_FAIL("Enlist child failed");
+	}
+
+	/* Set child as leader */
+	ret = ioctl(parent_fd, VBSD_COALITION_SET_LEADER, &child_fd);
+	if (ret != 0) {
+		pdkill(worker_fd, SIGKILL);
+		waitpid(worker_pid, NULL, 0);
+		close(worker_fd);
+		close(parent_fd);
+		close(child_fd);
+		return TEST_FAIL("Set leader failed");
+	}
+
+	/* Clear the leader */
+	ret = ioctl(parent_fd, VBSD_COALITION_SET_LEADER, &clear_fd);
+	if (ret != 0) {
+		pdkill(worker_fd, SIGKILL);
+		waitpid(worker_pid, NULL, 0);
+		close(worker_fd);
+		close(parent_fd);
+		close(child_fd);
+		return TEST_FAIL("Clear leader failed");
+	}
+
+	/* Terminate child - should NOT terminate parent */
+	ret = ioctl(child_fd, VBSD_COALITION_TERMINATE);
+	if (ret != 0) {
+		pdkill(worker_fd, SIGKILL);
+		waitpid(worker_pid, NULL, 0);
+		close(worker_fd);
+		close(parent_fd);
+		close(child_fd);
+		return TEST_FAIL("Terminate child failed");
+	}
+
+	usleep(100000);
+
+	/* Parent should NOT be terminating */
+	ret = ioctl(parent_fd, VBSD_COALITION_STAT, &st);
+	if (ret != 0) {
+		pdkill(worker_fd, SIGKILL);
+		waitpid(worker_pid, NULL, 0);
+		close(worker_fd);
+		close(parent_fd);
+		close(child_fd);
+		return TEST_FAIL("STAT failed");
+	}
+
+	if (st.vcs_flags & VBSD_STAT_TERMINATING) {
+		pdkill(worker_fd, SIGKILL);
+		waitpid(worker_pid, NULL, 0);
+		close(worker_fd);
+		close(parent_fd);
+		close(child_fd);
+		return TEST_FAIL("Parent should NOT be terminating");
+	}
+
+	/* Worker should still be alive */
+	ret = waitpid_timeout(worker_pid, &status, 300);
+	if (!(ret == 1 && errno == ETIMEDOUT)) {
+		close(worker_fd);
+		close(parent_fd);
+		close(child_fd);
+		return TEST_FAIL("Worker should still be alive");
+	}
+
+	pdkill(worker_fd, SIGKILL);
+	waitpid(worker_pid, NULL, 0);
+	close(worker_fd);
+	close(parent_fd);
+	close(child_fd);
+	return TEST_PASS(NULL);
+}
+
 /* =========================================================================
  * NESTED COALITION TESTS
  * ========================================================================= */
@@ -4864,6 +5496,18 @@ main(int argc __unused, char *argv[] __unused)
 	test_harness_register("test_stat_after_terminate",
 	    "Stat shows terminating flag", test_stat_after_terminate);
 
+	/* RUSAGE ioctl tests */
+	test_harness_register("test_rusage_empty_coalition",
+	    "Rusage on empty coalition", test_rusage_empty_coalition);
+	test_harness_register("test_rusage_with_process",
+	    "Rusage with enlisted process", test_rusage_with_process);
+	test_harness_register("test_rusage_multiple_processes",
+	    "Rusage aggregates multiple procs", test_rusage_multiple_processes);
+	test_harness_register("test_rusage_after_process_exit",
+	    "Rusage after process exit", test_rusage_after_process_exit);
+	test_harness_register("test_rusage_after_terminate",
+	    "Rusage works after terminate", test_rusage_after_terminate);
+
 	/* SET_SIGNAL ioctl tests */
 	test_harness_register("test_set_signal_valid",
 	    "Set valid termination signal", test_set_signal_valid);
@@ -4921,6 +5565,10 @@ main(int argc __unused, char *argv[] __unused)
 	    "Set non-procdesc as leader fails", test_leader_non_procdesc);
 	test_harness_register("test_leader_change",
 	    "Change leader from A to B", test_leader_change);
+	test_harness_register("test_leader_coalition",
+	    "Coalition leader death trigger", test_leader_coalition);
+	test_harness_register("test_leader_coalition_clear",
+	    "Clear coalition leader breaks link", test_leader_coalition_clear);
 
 	/* Nested coalition tests */
 	test_harness_register("test_nested_coalition_basic",
