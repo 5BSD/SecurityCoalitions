@@ -53,64 +53,21 @@
 
 #include "vbsd_coalition.h"
 
-/* ========================================================================
- * DTrace SDT Probes
- *
- * Provider: coalition
- *
- * Usage examples:
- *   dtrace -n 'coalition:::create { printf("pid=%d", arg0); }'
- *   dtrace -n 'coalition:::enlist { printf("fd=%d dtype=%d err=%d", arg0, arg1, arg2); }'
- *   dtrace -n 'coalition:::terminate { printf("members=%d err=%d", arg0, arg1); }'
- * ======================================================================== */
-
+/* DTrace SDT Probes */
 SDT_PROVIDER_DEFINE(coalition);
-
-/* coalition:::create(pid_t pid) */
-SDT_PROBE_DEFINE1(coalition, , , create,
-    "pid_t");
-
-/* coalition:::enlist(int fd, int dtype, int error) */
-SDT_PROBE_DEFINE3(coalition, , , enlist,
-    "int", "int", "int");
-
-/* coalition:::enlist__set(u_int count, u_int enlisted, int error) */
-SDT_PROBE_DEFINE3(coalition, , , enlist__set,
-    "u_int", "u_int", "int");
-
-/* coalition:::join(pid_t pid, int error) */
-SDT_PROBE_DEFINE2(coalition, , , join,
-    "pid_t", "int");
-
-/* coalition:::terminate(u_int member_count, int error) */
-SDT_PROBE_DEFINE2(coalition, , , terminate,
-    "u_int", "int");
-
-/* coalition:::close(u_int member_count) */
-SDT_PROBE_DEFINE1(coalition, , , close,
-    "u_int");
-
-/* coalition:::member__exit(pid_t pid) */
-SDT_PROBE_DEFINE1(coalition, , , member__exit,
-    "pid_t");
-
-/* coalition:::leader__exit(pid_t pid) - leader death triggers termination */
-SDT_PROBE_DEFINE1(coalition, , , leader__exit,
-    "pid_t");
-
-/* coalition:::fork__inherit(pid_t parent, pid_t child) */
-SDT_PROBE_DEFINE2(coalition, , , fork__inherit,
-    "pid_t", "pid_t")
+SDT_PROBE_DEFINE1(coalition, , , create, "pid_t");
+SDT_PROBE_DEFINE3(coalition, , , enlist, "int", "int", "int");
+SDT_PROBE_DEFINE3(coalition, , , enlist__set, "u_int", "u_int", "int");
+SDT_PROBE_DEFINE2(coalition, , , join, "pid_t", "int");
+SDT_PROBE_DEFINE2(coalition, , , terminate, "u_int", "int");
+SDT_PROBE_DEFINE1(coalition, , , close, "u_int");
+SDT_PROBE_DEFINE1(coalition, , , member__exit, "pid_t");
+SDT_PROBE_DEFINE1(coalition, , , leader__exit, "pid_t");
+SDT_PROBE_DEFINE2(coalition, , , fork__inherit, "pid_t", "pid_t")
 
 MALLOC_DEFINE(M_VBSD_COALITION, "vbsd_coalition", "vBSD Coalition structures");
 
-/* ========================================================================
- * Ops Registration Table
- *
- * DTYPE allocation:
- *   0-31    Reserved for FreeBSD (DTYPE_VNODE, DTYPE_SOCKET, etc.)
- *   32-255  Available for external modules (DTYPE_KEYVAULT, etc.)
- * ======================================================================== */
+/* Ops Registration Table */
 
 #define VBSD_OPS_TABLE_SIZE	256
 
@@ -140,10 +97,6 @@ vbsd_member_ops_register(int dtype, struct vbsd_member_ops *ops)
 		return (EEXIST);
 	}
 	vbsd_ops_table[dtype].member_count = 0;
-	/*
-	 * Release barrier ensures member_count=0 is visible before ops
-	 * pointer. Pairs with acquire in vbsd_member_ops_lookup().
-	 */
 	atomic_store_rel_ptr((uintptr_t *)&vbsd_ops_table[dtype].ops,
 	    (uintptr_t)ops);
 	mtx_unlock(&vbsd_ops_lock);
@@ -171,19 +124,7 @@ vbsd_member_ops_deregister(int dtype)
 	return (0);
 }
 
-/*
- * Acquire ops for a dtype, atomically incrementing member count.
- *
- * This function atomically looks up ops and increments member_count
- * under the ops lock, preventing a race with deregistration.
- *
- * If no ops are registered for this dtype, falls back to default ops.
- * This allows any fd type to be enlisted - types without custom
- * terminate behavior simply get fdrop() on coalition close.
- *
- * Returns ops pointer (never NULL for valid dtype).
- * Returns NULL only for invalid dtype (out of range).
- */
+/* Acquire ops for dtype, falls back to default_ops if unregistered */
 static struct vbsd_member_ops *
 vbsd_member_ops_acquire(int dtype)
 {
@@ -202,9 +143,6 @@ vbsd_member_ops_acquire(int dtype)
 	return (ops);
 }
 
-/*
- * Release ops for a dtype, decrementing member count.
- */
 static void
 vbsd_member_ops_release(int dtype)
 {
@@ -219,10 +157,6 @@ vbsd_member_ops_release(int dtype)
 	mtx_unlock(&vbsd_ops_lock);
 }
 
-/*
- * Increment member count for built-in ops that are never deregistered.
- * Used by self-join and fork inheritance where we know the ops are valid.
- */
 static void
 vbsd_member_count_inc_builtin(int dtype)
 {
@@ -237,9 +171,7 @@ vbsd_member_count_inc_builtin(int dtype)
 	mtx_unlock(&vbsd_ops_lock);
 }
 
-/* ========================================================================
- * UMA Zones and Global State
- * ======================================================================== */
+/* UMA Zones and Global State */
 
 static uma_zone_t vbsd_coalition_zone;
 static uma_zone_t vbsd_coalition_file_zone;
@@ -285,15 +217,7 @@ static void		vbsd_watchdog_callout(void *arg);
 static void		vbsd_watchdog_task_fn(void *context, int pending);
 static int		vbsd_coalition_terminate(struct vbsd_coalition *vc);
 
-/* ========================================================================
- * Sysctl Interface and Resource Limits
- * ======================================================================== */
-
-/*
- * Resource exhaustion limits.
- * Defaults are generous but prevent unbounded growth.
- * Set to 0 to disable limit (unlimited).
- */
+/* Sysctl Interface and Resource Limits */
 #define VBSD_DEFAULT_MAX_COALITIONS	0	/* 0 = unlimited */
 #define VBSD_DEFAULT_MAX_MEMBERS	0	/* 0 = unlimited */
 #define VBSD_DEFAULT_MAX_MEMBERS_PER	0	/* 0 = unlimited */
@@ -344,16 +268,11 @@ SYSCTL_PROC(_kern_coalition, OID_AUTO, members,
     sysctl_kern_coalition_members, "IU",
     "Total members across all coalitions");
 
-/*
- * Check if adding a member would exceed resource limits.
- * Returns 0 if OK, ENOMEM if limit would be exceeded.
- */
 static int
 vbsd_check_member_limits(struct vbsd_coalition *vc)
 {
 	u_int max, current, i;
 
-	/* Check per-coalition limit */
 	max = vbsd_max_members_per_coalition;
 	if (max != 0) {
 		current = atomic_load_acq_int(&vc->vc_member_count);
@@ -361,7 +280,6 @@ vbsd_check_member_limits(struct vbsd_coalition *vc)
 			return (ENOMEM);
 	}
 
-	/* Check global member limit */
 	max = vbsd_max_members;
 	if (max != 0) {
 		current = 0;
@@ -374,14 +292,7 @@ vbsd_check_member_limits(struct vbsd_coalition *vc)
 	return (0);
 }
 
-/* ========================================================================
- * Built-in Process Ops (DTYPE_PROCDESC)
- * ======================================================================== */
-
-/*
- * Process member data, stored in vm_data.
- * We need the proc pointer for signaling and hash table lookup.
- */
+/* Built-in Process Ops */
 struct vbsd_proc_data {
 	struct proc	*vpd_proc;
 };
@@ -416,15 +327,7 @@ static struct vbsd_member_ops vbsd_proc_ops = {
 	.mo_name	= "process",
 };
 
-/* ========================================================================
- * Built-in Jail Ops (DTYPE_JAILDESC)
- * ======================================================================== */
-
-/*
- * Jail member data, stored in vm_data.
- * Note: vjd_prison is only used during enlistment to set up OSD.
- * After enlistment, vbsd_jail_terminate() gets prison from fp->f_data.
- */
+/* Built-in Jail Ops */
 struct vbsd_jail_data {
 	struct prison	*vjd_prison;
 };
@@ -448,22 +351,7 @@ vbsd_jail_terminate(struct file *fp, struct thread *td __unused)
 	prison_hold(pr);
 	JAILDESC_UNLOCK(jd);
 
-	/*
-	 * Call prison_remove to kill all processes in the jail.
-	 *
-	 * prison_remove() requires:
-	 * 1. allprison_lock held exclusively (sx_xlock)
-	 * 2. pr->pr_mtx held (mtx_lock)
-	 * 3. A reference held on the prison (prison_hold)
-	 *
-	 * prison_remove() internally calls prison_deref() with
-	 * PD_DEREF | PD_LOCKED | PD_LIST_XLOCKED, which releases:
-	 * - Our held reference (PD_DEREF)
-	 * - The prison mutex (PD_LOCKED)
-	 * - The allprison_lock (PD_LIST_XLOCKED)
-	 *
-	 * So after prison_remove() returns, all locks are released.
-	 */
+	/* prison_remove releases locks and reference */
 	sx_xlock(&allprison_lock);
 	mtx_lock(&pr->pr_mtx);
 
@@ -471,9 +359,6 @@ vbsd_jail_terminate(struct file *fp, struct thread *td __unused)
 		prison_remove(pr);
 		/* prison_remove releases locks and reference */
 	} else {
-		/*
-		 * Prison is already dying. Release locks and our reference.
-		 */
 		mtx_unlock(&pr->pr_mtx);
 		sx_xunlock(&allprison_lock);
 		prison_free(pr);
@@ -487,15 +372,7 @@ static struct vbsd_member_ops vbsd_jail_ops = {
 	.mo_name	= "jail",
 };
 
-/* ========================================================================
- * Built-in Default Ops (pipes, sockets, vnodes, etc.)
- * ======================================================================== */
-
-/*
- * Default terminate - no-op.
- * For generic fds, terminate doesn't do anything special.
- * The fd will be closed via fdrop() afterward.
- */
+/* Built-in Default Ops */
 static int
 vbsd_default_terminate(struct file *fp __unused, struct thread *td __unused)
 {
@@ -507,9 +384,7 @@ static struct vbsd_member_ops vbsd_default_ops = {
 	.mo_name	= "generic",
 };
 
-/* ========================================================================
- * Built-in Socket Ops (DTYPE_SOCKET) - Aggressive shutdown
- * ======================================================================== */
+/* Built-in Socket Ops */
 
 static int
 vbsd_socket_terminate(struct file *fp, struct thread *td __unused)
@@ -528,9 +403,7 @@ static struct vbsd_member_ops vbsd_socket_ops = {
 	.mo_name	= "socket",
 };
 
-/* ========================================================================
- * Built-in SHM Ops (DTYPE_SHM) - Truncate to invalidate mappings
- * ======================================================================== */
+/* Built-in SHM Ops */
 
 static int
 vbsd_shm_terminate(struct file *fp, struct thread *td)
@@ -538,14 +411,6 @@ vbsd_shm_terminate(struct file *fp, struct thread *td)
 
 	KASSERT(fp != NULL, ("vbsd_shm_terminate: NULL fp"));
 
-	/*
-	 * Truncate to 0 - any process accessing mapped regions gets SIGBUS.
-	 * This effectively kills any process that touches the shared memory.
-	 *
-	 * Note: Uses caller's credentials. If the caller lacks permission
-	 * to truncate this SHM, the truncate will fail silently (error
-	 * logged but termination continues).
-	 */
 	return (fo_truncate(fp, 0, td->td_ucred, td));
 }
 
@@ -554,9 +419,7 @@ static struct vbsd_member_ops vbsd_shm_ops = {
 	.mo_name	= "shm",
 };
 
-/* ========================================================================
- * Built-in Coalition Ops (for nested coalitions)
- * ======================================================================== */
+/* Built-in Coalition Ops (nested) */
 
 /* Forward declaration */
 static struct fileops vbsd_coalition_fileops;
@@ -608,9 +471,7 @@ static struct vbsd_member_ops vbsd_coalition_ops = {
 	.mo_name	= "coalition",
 };
 
-/* ========================================================================
- * Coalition Core
- * ======================================================================== */
+/* Coalition Core */
 
 static int
 vbsd_coalition_fo_stat(struct file *fp __unused, struct stat *sb,
@@ -621,13 +482,7 @@ vbsd_coalition_fo_stat(struct file *fp __unused, struct stat *sb,
 	return (0);
 }
 
-/* ========================================================================
- * Kqueue Filter Operations
- * ======================================================================== */
-
-/*
- * Knlist lock functions for sx lock integration.
- */
+/* Kqueue Filter Operations */
 static void
 vbsd_knlist_lock(void *arg)
 {
@@ -778,14 +633,7 @@ vbsd_coalition_rel(struct vbsd_coalition *vc)
 		vbsd_coalition_free(vc);
 }
 
-/* ========================================================================
- * Deadline Termination
- * ======================================================================== */
-
-/*
- * Task function for deadline termination.
- * Runs in thread context (can sleep), performs the actual termination.
- */
+/* Deadline Termination */
 static void
 vbsd_deadline_task_fn(void *context, int pending __unused)
 {
@@ -879,14 +727,7 @@ vbsd_deadline_callout(void *arg)
 	taskqueue_enqueue(taskqueue_thread, &vc->vc_deadline_task);
 }
 
-/* ========================================================================
- * Watchdog
- * ======================================================================== */
-
-/*
- * Task function for watchdog expiration.
- * Runs in thread context, terminates the coalition.
- */
+/* Watchdog */
 static void
 vbsd_watchdog_task_fn(void *context, int pending __unused)
 {
@@ -952,9 +793,7 @@ vbsd_coalition_init_file(struct file *fp)
 	return (0);
 }
 
-/* ========================================================================
- * Process Hash Table (for exit handler)
- * ======================================================================== */
+/* Process Hash Table */
 
 static void
 vbsd_proc_hash_insert_locked(struct vbsd_member *vm, struct proc *p)
@@ -982,9 +821,7 @@ vbsd_proc_hash_lookup_locked(struct proc *p)
 	return (NULL);
 }
 
-/* ========================================================================
- * Jail OSD (for fork inheritance)
- * ======================================================================== */
+/* Jail OSD */
 
 struct vbsd_jail_osd {
 	struct vbsd_coalition	*vjo_coalition;
@@ -1043,13 +880,6 @@ vbsd_jail_set_coalition_atomic(struct prison *pr, struct vbsd_coalition *vc)
 }
 
 
-/*
- * Set the member back-pointer in the jail OSD.
- * Called after the member is fully set up, so the OSD destructor
- * can remove the member from the coalition when the prison is freed.
- *
- * Must be called with a valid prison reference held by caller.
- */
 static void
 vbsd_jail_set_member(struct prison *pr, struct vbsd_member *vm)
 {
@@ -1058,10 +888,6 @@ vbsd_jail_set_member(struct prison *pr, struct vbsd_member *vm)
 	if (vbsd_jail_osd_slot == 0)
 		return;
 
-	/*
-	 * Take prison_lock to synchronize with OSD destructor.
-	 * The destructor runs under prison_lock during prison_free.
-	 */
 	prison_lock(pr);
 	vjo = osd_jail_get(pr, vbsd_jail_osd_slot);
 	if (vjo != NULL)
@@ -1069,12 +895,6 @@ vbsd_jail_set_member(struct prison *pr, struct vbsd_member *vm)
 	prison_unlock(pr);
 }
 
-/*
- * Jail OSD destructor - called when prison is being freed.
- *
- * This is called from prison_deref() which runs in process context,
- * so curthread is valid and we can safely sleep (sx_xlock, fdrop).
- */
 static void
 vbsd_jail_osd_dtor(void *value)
 {
@@ -1088,25 +908,6 @@ vbsd_jail_osd_dtor(void *value)
 	vc = vjo->vjo_coalition;
 	vm = vjo->vjo_member;
 
-	/*
-	 * If this jail was enlisted as a member, we need to clean up.
-	 * However, we must be careful about races with fo_close:
-	 *
-	 * Scenario A: fo_close runs first
-	 *   - fo_close clears vjo_member to NULL
-	 *   - fo_close calls prison_remove, triggering this destructor
-	 *   - We see vm == NULL, skip member cleanup
-	 *   - fo_close frees vm (it's in jail_list)
-	 *
-	 * Scenario B: Prison freed first (e.g., jail -r while coalition open)
-	 *   - This destructor runs with vm != NULL
-	 *   - We remove from TAILQ and release refs
-	 *   - We DON'T free vm - fo_close will do it (or it leaks if fd leaked)
-	 *   - Later fo_close sees member not in TAILQ, handles appropriately
-	 *
-	 * The key insight: we should NEVER free vm here. Either fo_close
-	 * already freed it (vm == NULL), or fo_close will free it later.
-	 */
 	if (vm != NULL) {
 		int dtype = vm->vm_dtype;
 		struct thread *td = curthread;
@@ -1117,10 +918,6 @@ vbsd_jail_osd_dtor(void *value)
 		KASSERT((td->td_pflags & TDP_ITHREAD) == 0,
 		    ("vbsd_jail_osd_dtor: called from interrupt thread"));
 
-		/*
-		 * Check if member is still in TAILQ. fo_close sets tqe_prev
-		 * to NULL after removing, so we can detect if already removed.
-		 */
 		sx_xlock(&vc->vc_sx);
 		in_tailq = (vm->vm_link.tqe_prev != NULL);
 		if (in_tailq) {
@@ -1136,19 +933,11 @@ vbsd_jail_osd_dtor(void *value)
 		}
 		sx_xunlock(&vc->vc_sx);
 
-		/*
-		 * If this jail was the leader, trigger coalition termination.
-		 * Must be done before cleanup to ensure coalition is still valid.
-		 */
 		if (was_leader) {
 			SDT_PROBE1(coalition, , , leader__exit, 0);
 			vbsd_coalition_terminate(vc);
 		}
 
-		/*
-		 * If we removed from TAILQ, we own the cleanup.
-		 * If fo_close already removed it, fo_close owns cleanup.
-		 */
 		if (in_tailq) {
 			atomic_subtract_int(&vc->vc_member_count, 1);
 			vbsd_member_ops_release(dtype);
@@ -1178,14 +967,9 @@ vbsd_jail_osd_dtor(void *value)
 	free(vjo, M_VBSD_COALITION);
 }
 
-/* ========================================================================
- * Generic Enlistment
- * ======================================================================== */
+/* Generic Enlistment */
 
-/*
- * Check if a file is already enlisted in this coalition.
- * Must be called with vc_sx held.
- */
+/* Must be called with vc_sx held */
 static bool
 vbsd_coalition_has_member(struct vbsd_coalition *vc, struct file *fp)
 {
@@ -1444,9 +1228,7 @@ vbsd_coalition_enlist_generic(struct vbsd_coalition *vc, struct thread *td,
 	return (0);
 }
 
-/* ========================================================================
- * Self-Join (process joins its own coalition)
- * ======================================================================== */
+/* Self-Join */
 
 static int
 vbsd_coalition_join(struct vbsd_coalition *vc, struct thread *td)
@@ -1509,21 +1291,15 @@ vbsd_coalition_join(struct vbsd_coalition *vc, struct thread *td)
 	return (0);
 }
 
-/* ========================================================================
- * Termination (calls mo_terminate on all members)
- * ======================================================================== */
+/* Termination */
 
-/*
- * Terminate all members in the coalition.
- * Must be called with vc_sx held. Sets VCF_TERMINATING if not already set.
- */
+/* Must be called with vc_sx held */
 static void
 vbsd_coalition_terminate_members_locked(struct vbsd_coalition *vc,
     struct thread *td, bool skip_self)
 {
 	struct vbsd_member *vm;
 	struct proc *self;
-	int error;
 
 	sx_assert(&vc->vc_sx, SA_XLOCKED);
 
@@ -1531,65 +1307,37 @@ vbsd_coalition_terminate_members_locked(struct vbsd_coalition *vc,
 		return;
 
 	vc->vc_flags |= VCF_TERMINATING;
-
-	/* Notify kqueue watchers that termination has started */
 	KNOTE_LOCKED(&vc->vc_knlist, VBSD_NOTE_TERMINATING);
 
-	/* Close path may need to avoid killing the closing process itself. */
 	self = (skip_self && td != NULL) ? td->td_proc : NULL;
 
-	/* Terminate all members via their ops */
 	TAILQ_FOREACH(vm, &vc->vc_members, vm_link) {
 		if (vm->vm_ops == NULL)
 			continue;
 
 		/*
-		 * Skip jail members - they must be terminated OUTSIDE the
-		 * lock to avoid deadlock. prison_remove() can trigger the
-		 * OSD destructor which tries to take vc_sx.
-		 * Caller (fo_close) handles jail termination after unlocking.
+		 * Skip jail members - must be terminated outside the lock
+		 * to avoid deadlock with OSD destructor.
 		 */
 		if (vm->vm_ops == &vbsd_jail_ops)
 			continue;
 
 		if (vm->vm_fp != NULL && vm->vm_ops->mo_terminate != NULL) {
-			error = vm->vm_ops->mo_terminate(vm->vm_fp, td);
+			(void)vm->vm_ops->mo_terminate(vm->vm_fp, td);
 		} else if (vm->vm_data != NULL && vm->vm_ops == &vbsd_proc_ops) {
-			/*
-			 * Self-joined process - signal directly.
-			 *
-			 * Use atomic load with acquire semantics to read
-			 * vpd_proc. The exit handler uses atomic store with
-			 * release semantics to NULL it when the process exits.
-			 * This avoids taking the hash lock here (which would
-			 * violate lock ordering: we hold vc_sx, but fork
-			 * handler takes hash lock before vc_sx).
-			 *
-			 * If we read non-NULL, the process is still alive and
-			 * we take PROC_LOCK before signaling. Once we have
-			 * PROC_LOCK, the process can't exit until we release.
-			 */
 			struct vbsd_proc_data *vpd = vm->vm_data;
 			struct proc *p;
 
 			p = (struct proc *)atomic_load_acq_ptr(
 			    (uintptr_t *)&vpd->vpd_proc);
-			if (skip_self && self != NULL && p == self) {
-				error = 0;
+			if (skip_self && self != NULL && p == self)
 				continue;
-			}
 			if (p != NULL) {
 				PROC_LOCK(p);
 				kern_psignal(p, SIGKILL);
 				PROC_UNLOCK(p);
 			}
-			/* Process already dead or now signaled - success */
-			error = 0;
-		} else {
-			error = EINVAL;
 		}
-
-		(void)error;  /* Errors logged but don't stop termination */
 	}
 }
 
@@ -1699,11 +1447,7 @@ vbsd_coalition_terminate(struct vbsd_coalition *vc)
 	return (0);
 }
 
-/*
- * Signal all process members with a specific signal.
- * Used for graceful termination to send SIGTERM before SIGKILL.
- * Must be called with vc_sx held.
- */
+/* Must be called with vc_sx held */
 static void
 vbsd_coalition_signal_processes_locked(struct vbsd_coalition *vc, int sig)
 {
@@ -1749,10 +1493,7 @@ vbsd_coalition_signal_processes_locked(struct vbsd_coalition *vc, int sig)
 	}
 }
 
-/*
- * Count remaining live process members.
- * Must be called with vc_sx held.
- */
+/* Must be called with vc_sx held */
 static u_int
 vbsd_coalition_count_live_processes_locked(struct vbsd_coalition *vc)
 {
@@ -1792,12 +1533,6 @@ vbsd_coalition_count_live_processes_locked(struct vbsd_coalition *vc)
 	return (count);
 }
 
-/*
- * Graceful termination: send signal, wait for grace period, then SIGKILL.
- *
- * This is still a guaranteed kill switch - processes that don't exit
- * voluntarily during the grace period are forcefully terminated.
- */
 static int
 vbsd_coalition_terminate_graceful(struct vbsd_coalition *vc, int sig,
     u_int timeout_ms)
@@ -1822,36 +1557,25 @@ vbsd_coalition_terminate_graceful(struct vbsd_coalition *vc, int sig,
 	/* Phase 1: Send graceful signal to all processes */
 	vbsd_coalition_signal_processes_locked(vc, sig);
 
-	/* Phase 2: Wait for processes to exit, checking periodically */
 	elapsed = 0;
 	while (elapsed < timeout_ms) {
 		remaining = vbsd_coalition_count_live_processes_locked(vc);
 		if (remaining == 0)
 			break;
-
-		/* Release lock while sleeping to allow exit handlers to run */
 		sx_xunlock(&vc->vc_sx);
-
-		/* Sleep 100ms or remaining time, whichever is smaller */
 		u_int sleep_ms = (timeout_ms - elapsed);
 		if (sleep_ms > 100)
 			sleep_ms = 100;
-
 		error = pause_sbt("coalition_grace", SBT_1MS * sleep_ms,
 		    0, C_HARDCLOCK);
-		(void)error;  /* Ignore interrupts, continue waiting */
-
+		(void)error;
 		elapsed += sleep_ms;
 		sx_xlock(&vc->vc_sx);
-
-		/* Check if someone else terminated while we slept */
 		if (vc->vc_flags & VCF_TERMINATING) {
 			sx_xunlock(&vc->vc_sx);
-			return (0);  /* Already terminated */
+			return (0);
 		}
 	}
-
-	/* Phase 3: Force-kill any remaining members */
 	vbsd_coalition_terminate_members_locked(vc, curthread, false);
 
 	sx_xunlock(&vc->vc_sx);
@@ -1859,9 +1583,7 @@ vbsd_coalition_terminate_graceful(struct vbsd_coalition *vc, int sig,
 	return (0);
 }
 
-/* ========================================================================
- * Process Exit Handler
- * ======================================================================== */
+/* Process Exit Handler */
 
 static void
 vbsd_process_exit(void *arg __unused, struct proc *p)
@@ -1880,27 +1602,11 @@ vbsd_process_exit(void *arg __unused, struct proc *p)
 	SDT_PROBE1(coalition, , , member__exit, p->p_pid);
 
 	vc = vm->vm_coalition;
-	vbsd_coalition_ref(vc);  /* temp ref for safe access after unlock */
-
-	/*
-	 * Remove from hash so this process won't be found again.
-	 * Mark le_prev as NULL so fo_close knows not to LIST_REMOVE again.
-	 */
+	vbsd_coalition_ref(vc);
 	LIST_REMOVE(vm, vm_hash);
 	vm->vm_hash.le_prev = NULL;
 
-	/*
-	 * For self-joined processes (no file descriptor), NULL out the
-	 * cached proc pointer to prevent use-after-free. The proc struct
-	 * will be freed after we return, so terminate must not use it.
-	 * For enlisted processes, we use pd->pd_proc which is properly
-	 * NULLed by procdesc_exit().
-	 *
-	 * Use atomic store with release semantics to ensure the NULL is
-	 * visible to terminate which reads with acquire semantics. This
-	 * avoids needing to hold vc_sx in the exit handler (which would
-	 * risk deadlock with terminate_members_locked).
-	 */
+	/* NULL out cached proc pointer for self-joined processes */
 	if (vm->vm_fp == NULL && vm->vm_data != NULL) {
 		vpd = vm->vm_data;
 		atomic_store_rel_ptr((uintptr_t *)&vpd->vpd_proc, (uintptr_t)NULL);
@@ -1908,45 +1614,16 @@ vbsd_process_exit(void *arg __unused, struct proc *p)
 
 	rw_wunlock(&vbsd_proc_hash_lock);
 
-	/*
-	 * Do NOT remove from TAILQ, do NOT free the member, do NOT fdrop.
-	 * Leave vm in the coalition's member list for fo_close to clean up.
-	 *
-	 * This avoids races between exit handler and fo_close:
-	 * - If we tried to TAILQ_REMOVE here, fo_close might have already
-	 *   done so (double-remove corrupts list)
-	 * - If we freed vm here, fo_close would access freed memory
-	 * - If we fdrop here, we're in exit1() context which can interfere
-	 *   with procdesc_close and zombie reaping
-	 *
-	 * The vm is now "orphaned" (process dead, but member still in list).
-	 * When coalition fd is closed, fo_close will:
-	 * - Remove vm from TAILQ
-	 * - Release procdesc reference (fdrop) in safe context
-	 * - Free vm
-	 * - Release member's coalition reference
-	 *
-	 * The member's coalition reference keeps coalition alive until
-	 * fo_close runs.
-	 */
-
-	/*
-	 * Check if this was the leader process. If so, terminate the
-	 * entire coalition. We can safely take vc_sx here because we've
-	 * already released the hash lock.
-	 */
+	/* Leave member in list for fo_close cleanup */
 	if ((vc->vc_flags & VCF_HAS_LEADER) && p->p_pid == vc->vc_leader_pid) {
 		SDT_PROBE1(coalition, , , leader__exit, p->p_pid);
 		vbsd_coalition_terminate(vc);
 	}
 
-	/* Release only our temp reference */
 	vbsd_coalition_rel(vc);
 }
 
-/* ========================================================================
- * Process Fork Handler (for inheritance)
- * ======================================================================== */
+/* Process Fork Handler */
 
 static void
 vbsd_process_fork(void *arg __unused, struct proc *parent, struct proc *child,
@@ -1956,7 +1633,6 @@ vbsd_process_fork(void *arg __unused, struct proc *parent, struct proc *child,
 	struct vbsd_proc_data *vpd;
 	struct vbsd_coalition *vc;
 
-	/* Check if parent is in a coalition */
 	rw_rlock(&vbsd_proc_hash_lock);
 	pvm = vbsd_proc_hash_lookup_locked(parent);
 	if (pvm != NULL) {
@@ -2040,9 +1716,7 @@ vbsd_process_fork(void *arg __unused, struct proc *parent, struct proc *child,
 	vbsd_coalition_rel(vc);
 }
 
-/* ========================================================================
- * File Operations
- * ======================================================================== */
+/* File Operations */
 
 static int
 vbsd_coalition_fo_ioctl(struct file *fp, u_long cmd, void *data,
@@ -2085,12 +1759,11 @@ vbsd_coalition_fo_ioctl(struct file *fp, u_long cmd, void *data,
 
 	case VBSD_COALITION_TERMINATE:
 		{
-			u_int member_count;
+			u_int member_count __unused;
 			member_count = atomic_load_acq_int(&vc->vc_member_count);
 			AUDIT_ARG_VALUE(member_count);
 			error = vbsd_coalition_terminate(vc);
 			SDT_PROBE2(coalition, , , terminate, member_count, error);
-			(void)member_count;  /* suppress warning when probes disabled */
 		}
 		break;
 
@@ -2219,13 +1892,12 @@ vbsd_coalition_fo_ioctl(struct file *fp, u_long cmd, void *data,
 	case VBSD_COALITION_TERMINATE_GRACEFUL:
 		{
 			struct vbsd_graceful *g = data;
-			u_int member_count;
+			u_int member_count __unused;
 
 			member_count = atomic_load_acq_int(&vc->vc_member_count);
 			AUDIT_ARG_VALUE(member_count);
 			error = vbsd_coalition_terminate_graceful(vc, g->vg_signal,
 			    g->vg_timeout_ms);
-			(void)member_count;
 		}
 		break;
 
@@ -2770,25 +2442,19 @@ vbsd_coalition_fo_close(struct file *fp, struct thread *td)
 	struct vbsd_coalition_file *vcf;
 	struct vbsd_coalition *vc;
 	struct vbsd_member *vm, *vm_temp;
-	u_int member_count;
+	u_int member_count __unused;
 
 	vcf = fp->f_data;
 	if (vcf == NULL)
 		return (0);
-	fp->f_data = NULL;  /* Defensive: avoid double-close use-after-free */
-	KASSERT(vcf != NULL, ("vbsd_coalition_fo_close: NULL vcf"));
+	fp->f_data = NULL;
 	vc = vcf->vcf_coalition;
 	if (vc == NULL) {
 		uma_zfree(vbsd_coalition_file_zone, vcf);
 		return (0);
 	}
-	KASSERT(vc != NULL, ("vbsd_coalition_fo_close: NULL vc"));
 
-	/*
-	 * Drain any pending deadline/watchdog callout/task before acquiring vc_sx.
-	 * This prevents deadlock since the tasks also acquire vc_sx.
-	 * We drain unconditionally because checking flags without lock is racy.
-	 */
+	/* Drain pending callouts/tasks before acquiring vc_sx to avoid deadlock */
 	callout_drain(&vc->vc_deadline_callout);
 	taskqueue_drain(taskqueue_thread, &vc->vc_deadline_task);
 	callout_drain(&vc->vc_watchdog_callout);
@@ -2796,7 +2462,6 @@ vbsd_coalition_fo_close(struct file *fp, struct thread *td)
 
 	member_count = atomic_load_acq_int(&vc->vc_member_count);
 	SDT_PROBE1(coalition, , , close, member_count);
-	(void)member_count;
 
 	sx_xlock(&vc->vc_sx);
 
@@ -2968,9 +2633,7 @@ vbsd_coalition_fo_close(struct file *fp, struct thread *td)
 	return (0);
 }
 
-/* ========================================================================
- * Device and Module Init
- * ======================================================================== */
+/* Device and Module Init */
 
 static struct cdev *vbsd_coalition_dev;
 
