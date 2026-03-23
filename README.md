@@ -14,7 +14,7 @@ sudo ./tests/bin/coalition_test
 
 ```c
 // Supervisor creates coalition
-coalition_fd = open("/dev/coalition", O_RDWR);
+coalition_fd = open("/dev/vbsd_coalition", O_RDWR);
 
 // Enlist resources (processes, jails, sockets, devices, etc.)
 ioctl(coalition_fd, VBSD_COALITION_ENLIST, &resource_fd);

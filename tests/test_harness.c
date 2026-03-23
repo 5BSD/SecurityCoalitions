@@ -102,16 +102,16 @@ test_harness_summary(void)
 
 /*
  * Utility: Create a new coalition and return fd.
- * Each open of /dev/coalition creates a new coalition.
+ * Each open of /dev/vbsd_coalition creates a new coalition.
  */
 int
 create_coalition(void)
 {
 	int fd, flags;
 
-	fd = open("/dev/coalition", O_RDWR | O_CLOFORK);
+	fd = open("/dev/vbsd_coalition", O_RDWR | O_CLOFORK);
 	if (fd < 0 && errno == ENOENT) {
-		fprintf(stderr, "ERROR: /dev/coalition not found.\n");
+		fprintf(stderr, "ERROR: /dev/vbsd_coalition not found.\n");
 		fprintf(stderr, "Is the vbsd_coalition module loaded?\n");
 		fprintf(stderr, "Run: kldload ./sys/modules/vbsd_coalition/vbsd_coalition.ko\n");
 		return fd;

@@ -31,7 +31,7 @@ Apple's macOS/iOS also has a feature called "coalitions" (introduced in OS X 10.
 │                         SUPERVISOR PROCESS                          │
 │                                                                      │
 │   1. Create coalition                                                │
-│      coalition_fd = open("/dev/coalition", O_RDWR);                 │
+│      coalition_fd = open("/dev/vbsd_coalition", O_RDWR);                 │
 │                                                                      │
 │   2. Enlist resources                                                │
 │      ioctl(coalition_fd, VBSD_COALITION_ENLIST, &proc_fd);          │
@@ -53,7 +53,7 @@ Apple's macOS/iOS also has a feature called "coalitions" (introduced in OS X 10.
 ```
                     ┌──────────────────┐
                     │  Create Coalition │
-                    │ open(/dev/coalition)
+                    │ open(/dev/vbsd_coalition)
                     └────────┬─────────┘
                              │
                              ▼
@@ -96,7 +96,7 @@ Apple's macOS/iOS also has a feature called "coalitions" (introduced in OS X 10.
 #include <sys/vbsd_coalition.h>
 
 /* Create a coalition */
-int coalition_fd = open("/dev/coalition", O_RDWR);
+int coalition_fd = open("/dev/vbsd_coalition", O_RDWR);
 
 /* Enlist a single member (one-way, cannot unenlist) */
 int member_fd = ...;  /* procdesc, jaildesc, socket, device, coalition, etc. */
@@ -638,10 +638,10 @@ kldstat | grep vbsd_coalition
 vmstat -m | grep vbsd
 
 # Check coalition statistics
-sysctl kern.coalition
+sysctl kern.vbsd_coalition
 
 # Adjust resource limits (example)
-sysctl kern.coalition.max_coalitions=8192
+sysctl kern.vbsd_coalition.max_coalitions=8192
 
 # Unload module
 sudo kldunload vbsd_coalition
@@ -667,10 +667,10 @@ Coalition implements tunable resource limits via sysctl:
 
 | Sysctl | Default | Description |
 |--------|---------|-------------|
-| `kern.coalition.max_coalitions` | 0 | Maximum concurrent coalitions (0 = unlimited) |
-| `kern.coalition.max_members` | 0 | Maximum total members across all coalitions (0 = unlimited) |
-| `kern.coalition.max_members_per_coalition` | 0 | Maximum members per coalition (0 = unlimited) |
-| `kern.coalition.enlist_set_max` | 1024 | Maximum fds per VBSD_COALITION_ENLIST_SET call |
+| `kern.vbsd_coalition.max_coalitions` | 0 | Maximum concurrent coalitions (0 = unlimited) |
+| `kern.vbsd_coalition.max_members` | 0 | Maximum total members across all coalitions (0 = unlimited) |
+| `kern.vbsd_coalition.max_members_per_coalition` | 0 | Maximum members per coalition (0 = unlimited) |
+| `kern.vbsd_coalition.enlist_set_max` | 1024 | Maximum fds per VBSD_COALITION_ENLIST_SET call |
 
 Resource limit checks return `ENOMEM` when exceeded. Fork inheritance is exempt
 from limits (security takes precedence) but logs a warning when over limit.
@@ -704,45 +704,45 @@ Coalition defines a DTrace SDT provider `coalition` with the following probes:
 
 | Probe | Arguments | Description |
 |-------|-----------|-------------|
-| `coalition:::create` | `pid_t pid` | Coalition fd created |
-| `coalition:::enlist` | `int fd, int dtype, int error` | Single fd enlisted |
-| `coalition:::enlist__set` | `u_int count, u_int enlisted, int error` | Batch enlist |
-| `coalition:::join` | `pid_t pid, int error` | Process self-joined |
-| `coalition:::terminate` | `u_int member_count, int error` | Explicit terminate |
-| `coalition:::close` | `u_int member_count` | Coalition fd closed |
-| `coalition:::member__exit` | `pid_t pid` | Process member exited |
-| `coalition:::leader__exit` | `pid_t pid` | Leader process exited (triggers termination) |
-| `coalition:::fork__inherit` | `pid_t parent, pid_t child` | Child inherited coalition |
+| `vbsd_coalition:::create` | `pid_t pid` | Coalition fd created |
+| `vbsd_coalition:::enlist` | `int fd, int dtype, int error` | Single fd enlisted |
+| `vbsd_coalition:::enlist__set` | `u_int count, u_int enlisted, int error` | Batch enlist |
+| `vbsd_coalition:::join` | `pid_t pid, int error` | Process self-joined |
+| `vbsd_coalition:::terminate` | `u_int member_count, int error` | Explicit terminate |
+| `vbsd_coalition:::close` | `u_int member_count` | Coalition fd closed |
+| `vbsd_coalition:::member__exit` | `pid_t pid` | Process member exited |
+| `vbsd_coalition:::leader__exit` | `pid_t pid` | Leader process exited (triggers termination) |
+| `vbsd_coalition:::fork__inherit` | `pid_t parent, pid_t child` | Child inherited coalition |
 
 **DTrace Usage Examples:**
 
 ```sh
 # Trace all coalition activity
-dtrace -n 'coalition::: { printf("%s: %d", probename, arg0); }'
+dtrace -n 'vbsd_coalition::: { printf("%s: %d", probename, arg0); }'
 
 # Trace coalition creation with process info
-dtrace -n 'coalition:::create { printf("pid=%d comm=%s", arg0, execname); }'
+dtrace -n 'vbsd_coalition:::create { printf("pid=%d comm=%s", arg0, execname); }'
 
 # Trace enlistments with descriptor type
-dtrace -n 'coalition:::enlist {
+dtrace -n 'vbsd_coalition:::enlist {
     printf("fd=%d dtype=%d err=%d", arg0, arg1, arg2);
 }'
 
 # Trace terminations
-dtrace -n 'coalition:::terminate {
+dtrace -n 'vbsd_coalition:::terminate {
     printf("members=%d err=%d pid=%d", arg0, arg1, pid);
 }'
 
 # Count enlistments by type
-dtrace -n 'coalition:::enlist /arg2 == 0/ { @[arg1] = count(); }'
+dtrace -n 'vbsd_coalition:::enlist /arg2 == 0/ { @[arg1] = count(); }'
 
 # Track fork inheritance chains
-dtrace -n 'coalition:::fork__inherit {
+dtrace -n 'vbsd_coalition:::fork__inherit {
     printf("parent=%d -> child=%d", arg0, arg1);
 }'
 
 # Monitor batch enlistments
-dtrace -n 'coalition:::enlist__set {
+dtrace -n 'vbsd_coalition:::enlist__set {
     printf("requested=%d enlisted=%d err=%d", arg0, arg1, arg2);
 }'
 ```

@@ -67,7 +67,7 @@ create_coalition(void)
 {
 	int fd, flags;
 
-	fd = open("/dev/coalition", O_RDWR | O_CLOFORK);
+	fd = open("/dev/vbsd_coalition", O_RDWR | O_CLOFORK);
 	if (fd < 0)
 		return (-1);
 
@@ -788,8 +788,8 @@ main(int argc, char *argv[])
 	int result = 0;
 
 	/* Check if device exists */
-	if (access("/dev/coalition", F_OK) != 0) {
-		fprintf(stderr, "ERROR: /dev/coalition not found.\n");
+	if (access("/dev/vbsd_coalition", F_OK) != 0) {
+		fprintf(stderr, "ERROR: /dev/vbsd_coalition not found.\n");
 		fprintf(stderr, "Is the vbsd_coalition module loaded?\n");
 		return (1);
 	}

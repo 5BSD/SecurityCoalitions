@@ -16,12 +16,12 @@ int main(void)
 	int status;
 
 	/* Open with O_CLOFORK */
-	fd = open("/dev/coalition", O_RDWR | O_CLOFORK);
+	fd = open("/dev/vbsd_coalition", O_RDWR | O_CLOFORK);
 	if (fd < 0) {
 		perror("open");
 		return 1;
 	}
-	printf("Parent: opened /dev/coalition as fd %d\n", fd);
+	printf("Parent: opened /dev/vbsd_coalition as fd %d\n", fd);
 
 	/* Verify FD_CLOFORK is set */
 	flags = fcntl(fd, F_GETFD);

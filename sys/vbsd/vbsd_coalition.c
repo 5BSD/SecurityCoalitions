@@ -54,16 +54,16 @@
 #include "vbsd_coalition.h"
 
 /* DTrace SDT Probes */
-SDT_PROVIDER_DEFINE(coalition);
-SDT_PROBE_DEFINE1(coalition, , , create, "pid_t");
-SDT_PROBE_DEFINE3(coalition, , , enlist, "int", "int", "int");
-SDT_PROBE_DEFINE3(coalition, , , enlist__set, "u_int", "u_int", "int");
-SDT_PROBE_DEFINE2(coalition, , , join, "pid_t", "int");
-SDT_PROBE_DEFINE2(coalition, , , terminate, "u_int", "int");
-SDT_PROBE_DEFINE1(coalition, , , close, "u_int");
-SDT_PROBE_DEFINE1(coalition, , , member__exit, "pid_t");
-SDT_PROBE_DEFINE1(coalition, , , leader__exit, "pid_t");
-SDT_PROBE_DEFINE2(coalition, , , fork__inherit, "pid_t", "pid_t")
+SDT_PROVIDER_DEFINE(vbsd_coalition);
+SDT_PROBE_DEFINE1(vbsd_coalition, , , create, "pid_t");
+SDT_PROBE_DEFINE3(vbsd_coalition, , , enlist, "int", "int", "int");
+SDT_PROBE_DEFINE3(vbsd_coalition, , , enlist__set, "u_int", "u_int", "int");
+SDT_PROBE_DEFINE2(vbsd_coalition, , , join, "pid_t", "int");
+SDT_PROBE_DEFINE2(vbsd_coalition, , , terminate, "u_int", "int");
+SDT_PROBE_DEFINE1(vbsd_coalition, , , close, "u_int");
+SDT_PROBE_DEFINE1(vbsd_coalition, , , member__exit, "pid_t");
+SDT_PROBE_DEFINE1(vbsd_coalition, , , leader__exit, "pid_t");
+SDT_PROBE_DEFINE2(vbsd_coalition, , , fork__inherit, "pid_t", "pid_t")
 
 MALLOC_DEFINE(M_VBSD_COALITION, "vbsd_coalition", "vBSD Coalition structures");
 
@@ -221,30 +221,30 @@ static u_int vbsd_max_members = VBSD_DEFAULT_MAX_MEMBERS;
 static u_int vbsd_max_members_per_coalition = VBSD_DEFAULT_MAX_MEMBERS_PER;
 static u_int vbsd_enlist_set_max = VBSD_DEFAULT_ENLIST_SET_MAX;
 
-SYSCTL_NODE(_kern, OID_AUTO, coalition, CTLFLAG_RW | CTLFLAG_MPSAFE, 0,
+SYSCTL_NODE(_kern, OID_AUTO, vbsd_coalition, CTLFLAG_RW | CTLFLAG_MPSAFE, 0,
     "vBSD Coalition");
 
-SYSCTL_UINT(_kern_coalition, OID_AUTO, count, CTLFLAG_RD,
+SYSCTL_UINT(_kern_vbsd_coalition, OID_AUTO, count, CTLFLAG_RD,
     __DEVOLATILE(u_int *, &vbsd_coalition_count), 0,
     "Number of active coalitions");
 
-SYSCTL_UINT(_kern_coalition, OID_AUTO, max_coalitions, CTLFLAG_RW,
+SYSCTL_UINT(_kern_vbsd_coalition, OID_AUTO, max_coalitions, CTLFLAG_RW,
     &vbsd_max_coalitions, 0,
     "Maximum number of coalitions (0 = unlimited)");
 
-SYSCTL_UINT(_kern_coalition, OID_AUTO, max_members, CTLFLAG_RW,
+SYSCTL_UINT(_kern_vbsd_coalition, OID_AUTO, max_members, CTLFLAG_RW,
     &vbsd_max_members, 0,
     "Maximum total members across all coalitions (0 = unlimited)");
 
-SYSCTL_UINT(_kern_coalition, OID_AUTO, max_members_per_coalition, CTLFLAG_RW,
+SYSCTL_UINT(_kern_vbsd_coalition, OID_AUTO, max_members_per_coalition, CTLFLAG_RW,
     &vbsd_max_members_per_coalition, 0,
     "Maximum members per coalition (0 = unlimited)");
 
-SYSCTL_UINT(_kern_coalition, OID_AUTO, enlist_set_max, CTLFLAG_RW,
+SYSCTL_UINT(_kern_vbsd_coalition, OID_AUTO, enlist_set_max, CTLFLAG_RW,
     &vbsd_enlist_set_max, 0,
     "Maximum fds per VBSD_COALITION_ENLIST_SET call (default 1024)");
 
-SYSCTL_UINT(_kern_coalition, OID_AUTO, members, CTLFLAG_RD,
+SYSCTL_UINT(_kern_vbsd_coalition, OID_AUTO, members, CTLFLAG_RD,
     __DEVOLATILE(u_int *, &vbsd_member_count), 0,
     "Total members across all coalitions");
 
@@ -486,7 +486,7 @@ vbsd_knlist_assert_lock(void *arg, int what)
 }
 
 static void
-filt_coalition_detach(struct knote *kn)
+filt_vbsd_coalition_detach(struct knote *kn)
 {
 	struct vbsd_coalition *vc = kn->kn_hook;
 
@@ -494,7 +494,7 @@ filt_coalition_detach(struct knote *kn)
 }
 
 static int
-filt_coalition_event(struct knote *kn, long hint)
+filt_vbsd_coalition_event(struct knote *kn, long hint)
 {
 
 	/*
@@ -507,10 +507,10 @@ filt_coalition_event(struct knote *kn, long hint)
 	return (kn->kn_fflags != 0);
 }
 
-static struct filterops coalition_filtops = {
+static struct filterops vbsd_coalition_filtops = {
 	.f_isfd = 1,
-	.f_detach = filt_coalition_detach,
-	.f_event = filt_coalition_event,
+	.f_detach = filt_vbsd_coalition_detach,
+	.f_event = filt_vbsd_coalition_event,
 };
 
 static int
@@ -524,7 +524,7 @@ vbsd_coalition_fo_kqfilter(struct file *fp, struct knote *kn)
 
 	switch (kn->kn_filter) {
 	case EVFILT_READ:
-		kn->kn_fop = &coalition_filtops;
+		kn->kn_fop = &vbsd_coalition_filtops;
 		kn->kn_hook = vc;
 		knlist_add(&vc->vc_knlist, kn, 0);
 		return (0);
@@ -749,7 +749,7 @@ vbsd_coalition_init_file(struct file *fp)
 	vc = vbsd_coalition_alloc();
 	finit(fp, FREAD | FWRITE, DTYPE_DEV, vc, &vbsd_coalition_fileops);
 
-	SDT_PROBE1(coalition, , , create, curthread->td_proc->p_pid);
+	SDT_PROBE1(vbsd_coalition, , , create, curthread->td_proc->p_pid);
 
 	return (0);
 }
@@ -875,7 +875,7 @@ vbsd_jail_osd_dtor(void *value)
 		sx_xunlock(&vc->vc_sx);
 
 		if (was_leader) {
-			SDT_PROBE1(coalition, , , leader__exit, 0);
+			SDT_PROBE1(vbsd_coalition, , , leader__exit, 0);
 			vbsd_coalition_terminate(vc);
 		}
 
@@ -1326,7 +1326,7 @@ vbsd_coalition_terminate(struct vbsd_coalition *vc)
 				parent_vc->vc_leader = NULL;
 				sx_xunlock(&parent_vc->vc_sx);
 
-				SDT_PROBE1(coalition, , , leader__exit, 0);
+				SDT_PROBE1(vbsd_coalition, , , leader__exit, 0);
 				vbsd_coalition_terminate(parent_vc);
 			} else {
 				sx_xunlock(&parent_vc->vc_sx);
@@ -1480,7 +1480,7 @@ vbsd_process_exit(void *arg __unused, struct proc *p)
 		return;
 	}
 
-	SDT_PROBE1(coalition, , , member__exit, p->p_pid);
+	SDT_PROBE1(vbsd_coalition, , , member__exit, p->p_pid);
 
 	vc = vm->vm_coalition;
 	vbsd_coalition_ref(vc);
@@ -1494,7 +1494,7 @@ vbsd_process_exit(void *arg __unused, struct proc *p)
 	rw_wunlock(&vbsd_proc_hash_lock);
 
 	if ((vc->vc_flags & VCF_HAS_LEADER) && p->p_pid == vc->vc_leader_pid) {
-		SDT_PROBE1(coalition, , , leader__exit, p->p_pid);
+		SDT_PROBE1(vbsd_coalition, , , leader__exit, p->p_pid);
 		vbsd_coalition_terminate(vc);
 	}
 
@@ -1552,7 +1552,7 @@ vbsd_process_fork(void *arg __unused, struct proc *parent, struct proc *child,
 	sx_xunlock(&vc->vc_sx);
 	rw_wunlock(&vbsd_proc_hash_lock);
 
-	SDT_PROBE2(coalition, , , fork__inherit, parent->p_pid, child->p_pid);
+	SDT_PROBE2(vbsd_coalition, , , fork__inherit, parent->p_pid, child->p_pid);
 	vbsd_coalition_rel(vc);
 }
 
@@ -1574,11 +1574,11 @@ vbsd_coalition_fo_ioctl(struct file *fp, u_long cmd, void *data,
 		AUDIT_ARG_FD(target_fd);
 		error = fget(td, target_fd, &cap_no_rights, &target_fp);
 		if (error != 0) {
-			SDT_PROBE3(coalition, , , enlist, target_fd, -1, error);
+			SDT_PROBE3(vbsd_coalition, , , enlist, target_fd, -1, error);
 			return (error);
 		}
 		error = vbsd_coalition_enlist_generic(vc, td, target_fp);
-		SDT_PROBE3(coalition, , , enlist, target_fd,
+		SDT_PROBE3(vbsd_coalition, , , enlist, target_fd,
 		    target_fp->f_type, error);
 		fdrop(target_fp, td);
 		/*
@@ -1592,7 +1592,7 @@ vbsd_coalition_fo_ioctl(struct file *fp, u_long cmd, void *data,
 	case VBSD_COALITION_JOIN:
 		AUDIT_ARG_PID(td->td_proc->p_pid);
 		error = vbsd_coalition_join(vc, td);
-		SDT_PROBE2(coalition, , , join, td->td_proc->p_pid, error);
+		SDT_PROBE2(vbsd_coalition, , , join, td->td_proc->p_pid, error);
 		break;
 
 	case VBSD_COALITION_TERMINATE:
@@ -1601,7 +1601,7 @@ vbsd_coalition_fo_ioctl(struct file *fp, u_long cmd, void *data,
 			member_count = atomic_load_acq_int(&vc->vc_member_count);
 			AUDIT_ARG_VALUE(member_count);
 			error = vbsd_coalition_terminate(vc);
-			SDT_PROBE2(coalition, , , terminate, member_count, error);
+			SDT_PROBE2(vbsd_coalition, , , terminate, member_count, error);
 		}
 		break;
 
@@ -1617,11 +1617,11 @@ vbsd_coalition_fo_ioctl(struct file *fp, u_long cmd, void *data,
 
 			/* Validate count */
 			if (es->count == 0) {
-				SDT_PROBE3(coalition, , , enlist__set, 0, 0, 0);
+				SDT_PROBE3(vbsd_coalition, , , enlist__set, 0, 0, 0);
 				break;
 			}
 			if (es->count > vbsd_enlist_set_max) {
-				SDT_PROBE3(coalition, , , enlist__set,
+				SDT_PROBE3(vbsd_coalition, , , enlist__set,
 				    es->count, 0, EINVAL);
 				error = EINVAL;
 				break;
@@ -1634,7 +1634,7 @@ vbsd_coalition_fo_ioctl(struct file *fp, u_long cmd, void *data,
 			/* Copy in fd array from userspace */
 			error = copyin(es->fds, fds, es->count * sizeof(int));
 			if (error != 0) {
-				SDT_PROBE3(coalition, , , enlist__set,
+				SDT_PROBE3(vbsd_coalition, , , enlist__set,
 				    es->count, 0, error);
 				free(fds, M_VBSD_COALITION);
 				break;
@@ -1657,7 +1657,7 @@ vbsd_coalition_fo_ioctl(struct file *fp, u_long cmd, void *data,
 				es->enlisted++;
 			}
 
-			SDT_PROBE3(coalition, , , enlist__set,
+			SDT_PROBE3(vbsd_coalition, , , enlist__set,
 			    es->count, es->enlisted, error);
 			free(fds, M_VBSD_COALITION);
 
@@ -2272,7 +2272,7 @@ vbsd_coalition_fo_close(struct file *fp, struct thread *td)
 	taskqueue_drain(taskqueue_thread, &vc->vc_watchdog_task);
 
 	member_count = atomic_load_acq_int(&vc->vc_member_count);
-	SDT_PROBE1(coalition, , , close, member_count);
+	SDT_PROBE1(vbsd_coalition, , , close, member_count);
 
 	sx_xlock(&vc->vc_sx);
 
@@ -2449,7 +2449,7 @@ vbsd_coalition_dev_fdopen(struct cdev *dev __unused, int oflags __unused,
 static struct cdevsw vbsd_coalition_cdevsw = {
 	.d_version = D_VERSION,
 	.d_fdopen = vbsd_coalition_dev_fdopen,
-	.d_name = "coalition",
+	.d_name = "vbsd_coalition",
 };
 
 static int
@@ -2536,7 +2536,7 @@ vbsd_coalition_mod_init(void)
 		goto fail_event;
 
 	vbsd_coalition_dev = make_dev(&vbsd_coalition_cdevsw, 0,
-	    UID_ROOT, GID_WHEEL, 0600, "coalition");
+	    UID_ROOT, GID_WHEEL, 0600, "vbsd_coalition");
 	if (vbsd_coalition_dev == NULL) {
 		error = ENXIO;
 		goto fail_dev;

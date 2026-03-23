@@ -208,7 +208,7 @@ get_jail_id(const char *name)
 }
 
 /* =========================================================================
- * FEATURE: Coalition Creation (open /dev/coalition)
+ * FEATURE: Coalition Creation (open /dev/vbsd_coalition)
  * ========================================================================= */
 
 /*
@@ -1585,7 +1585,7 @@ test_enlist_set_exceeds_max(void)
 
 	/* Get current limit from sysctl */
 	len = sizeof(enlist_set_max);
-	ret = sysctlbyname("kern.coalition.enlist_set_max",
+	ret = sysctlbyname("kern.vbsd_coalition.enlist_set_max",
 	    &enlist_set_max, &len, NULL, 0);
 	TEST_ASSERT(ret == 0, "Failed to read enlist_set_max sysctl");
 
@@ -2276,7 +2276,7 @@ test_enlist_set_at_limit(void)
 
 	/* Get current limit */
 	len = sizeof(max);
-	ret = sysctlbyname("kern.coalition.enlist_set_max", &max, &len,
+	ret = sysctlbyname("kern.vbsd_coalition.enlist_set_max", &max, &len,
 	    NULL, 0);
 	TEST_ASSERT(ret == 0, "Failed to read sysctl");
 
@@ -2372,13 +2372,13 @@ test_limit_zero_unlimited(void)
 
 	/* Get and save current limit */
 	len = sizeof(old_max);
-	ret = sysctlbyname("kern.coalition.max_coalitions", &old_max, &len,
+	ret = sysctlbyname("kern.vbsd_coalition.max_coalitions", &old_max, &len,
 	    NULL, 0);
 	TEST_ASSERT(ret == 0, "Failed to read sysctl");
 
 	/* Set to 0 (unlimited) */
 	zero = 0;
-	ret = sysctlbyname("kern.coalition.max_coalitions", NULL, NULL,
+	ret = sysctlbyname("kern.vbsd_coalition.max_coalitions", NULL, NULL,
 	    &zero, sizeof(zero));
 	if (ret != 0)
 		return TEST_PASS("Skipped (cannot set sysctl)");
@@ -2395,7 +2395,7 @@ test_limit_zero_unlimited(void)
 		close(coal_fds[i]);
 
 	/* Restore old limit */
-	sysctlbyname("kern.coalition.max_coalitions", NULL, NULL,
+	sysctlbyname("kern.vbsd_coalition.max_coalitions", NULL, NULL,
 	    &old_max, sizeof(old_max));
 
 	return TEST_PASS(NULL);
@@ -2624,13 +2624,13 @@ test_max_coalitions_limit(void)
 
 	/* Get and save current limit */
 	len = sizeof(old_max);
-	ret = sysctlbyname("kern.coalition.max_coalitions", &old_max, &len,
+	ret = sysctlbyname("kern.vbsd_coalition.max_coalitions", &old_max, &len,
 	    NULL, 0);
 	TEST_ASSERT(ret == 0, "Failed to read max_coalitions sysctl");
 
 	/* Set a low limit */
 	new_max = 3;
-	ret = sysctlbyname("kern.coalition.max_coalitions", NULL, NULL,
+	ret = sysctlbyname("kern.vbsd_coalition.max_coalitions", NULL, NULL,
 	    &new_max, sizeof(new_max));
 	if (ret != 0) {
 		/* May need root */
@@ -2645,7 +2645,7 @@ test_max_coalitions_limit(void)
 	}
 
 	/* Next one should fail with ENOMEM */
-	coal_fds[3] = open("/dev/coalition", O_RDWR);
+	coal_fds[3] = open("/dev/vbsd_coalition", O_RDWR);
 	TEST_ASSERT(coal_fds[3] < 0 && errno == ENOMEM,
 	    "Should fail with ENOMEM when exceeding max_coalitions");
 
@@ -2654,7 +2654,7 @@ test_max_coalitions_limit(void)
 		close(coal_fds[j]);
 
 	/* Restore old limit */
-	sysctlbyname("kern.coalition.max_coalitions", NULL, NULL,
+	sysctlbyname("kern.vbsd_coalition.max_coalitions", NULL, NULL,
 	    &old_max, sizeof(old_max));
 
 	return TEST_PASS(NULL);
@@ -2675,13 +2675,13 @@ test_max_members_limit(void)
 
 	/* Get and save current limit */
 	len = sizeof(old_max);
-	ret = sysctlbyname("kern.coalition.max_members_per_coalition",
+	ret = sysctlbyname("kern.vbsd_coalition.max_members_per_coalition",
 	    &old_max, &len, NULL, 0);
 	TEST_ASSERT(ret == 0, "Failed to read max_members_per_coalition sysctl");
 
 	/* Set a low limit */
 	new_max = 2;
-	ret = sysctlbyname("kern.coalition.max_members_per_coalition",
+	ret = sysctlbyname("kern.vbsd_coalition.max_members_per_coalition",
 	    NULL, NULL, &new_max, sizeof(new_max));
 	if (ret != 0) {
 		return TEST_PASS("Skipped (cannot set sysctl)");
@@ -2710,7 +2710,7 @@ test_max_members_limit(void)
 	close(coal_fd);
 
 	/* Restore old limit */
-	sysctlbyname("kern.coalition.max_members_per_coalition", NULL, NULL,
+	sysctlbyname("kern.vbsd_coalition.max_members_per_coalition", NULL, NULL,
 	    &old_max, sizeof(old_max));
 
 	return TEST_PASS(NULL);
