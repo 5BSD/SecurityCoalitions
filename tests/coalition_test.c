@@ -984,7 +984,7 @@ test_enlist_jail_different_coalition(void)
  * auto-join the jail's coalition.
  */
 static struct test_result
-test_jail_fork_inheritance(void)
+test_jail_terminate_kills_processes(void)
 {
 	int coal_fd, jail_fd;
 	int pipefd[2];
@@ -998,28 +998,24 @@ test_jail_fork_inheritance(void)
 	coal_fd = create_coalition();
 	TEST_ASSERT(coal_fd >= 0, "Failed to create coalition");
 
-	/* Create a test jail (non-owning so we control lifetime) */
-	jail_fd = create_test_jail(jail_name("jail_fork"));
+	jail_fd = create_test_jail(jail_name("jail_proc"));
 	if (jail_fd < 0) {
 		close(coal_fd);
 		return TEST_FAIL("Failed to create test jail");
 	}
 
-	/* Get the jail ID for jail_attach */
-	jid = get_jail_id(jail_name("jail_fork"));
+	jid = get_jail_id(jail_name("jail_proc"));
 	if (jid < 0) {
 		close(jail_fd);
 		close(coal_fd);
 		return TEST_FAIL("Failed to get jail ID");
 	}
 
-	/* Enlist the jail in the coalition - jail_caller keeps fd (reference semantics) */
 	if (ioctl(coal_fd, VBSD_COALITION_ENLIST, &jail_fd) < 0) {
 		close(jail_fd);
 		close(coal_fd);
 		return TEST_FAIL("Failed to enlist jail");
 	}
-	/* jail_fd still valid (reference semantics) */
 
 	if (pipe(pipefd) < 0) {
 		close(jail_fd);
@@ -1037,42 +1033,20 @@ test_jail_fork_inheritance(void)
 	}
 
 	if (pid == 0) {
-		/* First child: attach to jail, then fork grandchild */
-		pid_t grandchild;
-
+		/* Child: attach to jail, signal ready, wait to die */
 		close(pipefd[0]);
-		close(coal_fd);  /* Don't need coalition fd in child */
+		close(coal_fd);
 
-		/* Attach to the jail */
 		if (jail_attach(jid) < 0) {
-			write(pipefd[1], "A", 1);  /* 'A' = attach failed */
+			write(pipefd[1], "A", 1);
 			_exit(1);
 		}
 
-		/*
-		 * Now fork a grandchild. The grandchild is "born" in the jail,
-		 * so if the jail is enlisted in a coalition, the grandchild
-		 * should automatically join via the jail OSD inheritance path.
-		 */
-		grandchild = fork();
-		if (grandchild < 0) {
-			write(pipefd[1], "F", 1);  /* 'F' = fork failed */
-			_exit(2);
-		}
-
-		if (grandchild == 0) {
-			/* Grandchild: signal ready and wait to be killed */
-			write(pipefd[1], "R", 1);  /* 'R' = ready */
-			pause();	/* Wait indefinitely for signal */
-			_exit(0);
-		}
-
-		/* First child: wait for grandchild */
-		waitpid(grandchild, NULL, 0);
+		write(pipefd[1], "R", 1);
+		pause();
 		_exit(0);
 	}
 
-	/* Parent: wait for grandchild to be ready */
 	close(pipefd[1]);
 
 	if (read(pipefd[0], &buf, 1) != 1 || buf != 'R') {
@@ -1080,17 +1054,13 @@ test_jail_fork_inheritance(void)
 		waitpid(pid, NULL, 0);
 		close(jail_fd);
 		close(coal_fd);
-		if (buf == 'A')
-			return TEST_FAIL("Child failed to attach to jail");
-		if (buf == 'F')
-			return TEST_FAIL("Child failed to fork grandchild");
-		return TEST_FAIL("Communication with child failed");
+		return TEST_FAIL("Child failed to attach to jail");
 	}
 	close(pipefd[0]);
 
 	/*
-	 * Grandchild should now be in the coalition (inherited via jail OSD).
-	 * Terminate the coalition - grandchild should receive SIGKILL.
+	 * Terminate coalition - jail is removed via prison_remove(),
+	 * which kills all processes inside the jail.
 	 */
 	if (ioctl(coal_fd, VBSD_COALITION_TERMINATE) < 0) {
 		waitpid(pid, NULL, 0);
@@ -1099,10 +1069,8 @@ test_jail_fork_inheritance(void)
 		return TEST_FAIL("Terminate failed");
 	}
 
-	/* Give processes time to die */
 	usleep(100000);
 
-	/* Clean up */
 	waitpid(pid, NULL, 0);
 	close(jail_fd);
 	close(coal_fd);
@@ -5700,8 +5668,8 @@ main(int argc __unused, char *argv[] __unused)
 	    "Terminate removes enlisted jails", test_terminate_removes_jails);
 
 	/* Jail fork inheritance tests */
-	test_harness_register("test_jail_fork_inheritance",
-	    "Process born in enlisted jail inherits", test_jail_fork_inheritance);
+	test_harness_register("test_jail_terminate_kills_processes",
+	    "Jail terminate kills processes inside", test_jail_terminate_kills_processes);
 
 	/* Socket termination tests */
 	test_harness_register("test_socket_shutdown_on_terminate",

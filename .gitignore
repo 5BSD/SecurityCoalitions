@@ -43,3 +43,4 @@ sys/modules/vos_coalition/i386
 .codex
 .ai
 sys/modules/vbsd_coalition/i386
+samples/keyvault/i386

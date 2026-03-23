@@ -171,91 +171,38 @@ close(coalition_fd);
 ```c
 #include <sys/vbsd_coalition.h>
 
-/*
- * Member operations - implement these for your resource type.
- */
 struct vbsd_member_ops {
-    /*
-     * Terminate the resource. Called when the coalition is closed.
-     *
-     * For types with interior revocation (opt-in):
-     *   - Process: kern_psignal(SIGKILL)
-     *   - Jail: prison_remove()
-     *   - Socket: soshutdown(SHUT_RDWR)
-     *   - Custom: set a "revoked" flag, invalidate keys, etc.
-     *
-     * For types without interior revocation:
-     *   - Return 0 (no-op). Coalition will fdrop() afterward.
-     *
-     * Returns 0 on success. Errors are logged but don't stop
-     * termination of other members.
-     */
-    int     (*mo_terminate)(struct file *fp, struct thread *td);
-
-    /* Name for logging/debugging */
-    const char *mo_name;
+    int         (*mo_terminate)(struct file *fp, struct thread *td);
+    const char  *mo_name;
 };
 
 /*
- * Register ops for a file descriptor type.
- *
- * Call this at module load time. The dtype must be a valid DTYPE_*
- * constant (DTYPE_PROCDESC, DTYPE_JAILDESC, or a custom type).
- *
- * Returns:
- *   0        - success
- *   EEXIST   - ops already registered for this dtype
- *   EINVAL   - invalid dtype or ops
+ * Register ops for a custom descriptor type. Coalition assigns the dtype.
+ * Use the returned dtype in finit() when creating descriptors.
  */
-int vbsd_member_ops_register(int dtype, struct vbsd_member_ops *ops);
-
-/*
- * Deregister ops for a file descriptor type.
- *
- * Call this at module unload.
- *
- * Returns:
- *   0        - success
- */
+int vbsd_member_ops_register(struct vbsd_member_ops *ops, int *dtype_out);
 int vbsd_member_ops_deregister(int dtype);
+
+/* Check if coalition module is loaded (for optional integration) */
+bool vbsd_coalition_available(void);
 ```
 
 ## Implementing Coalition Support in Your Module
 
-Most built-in types (files, pipes, sockets, etc.) are already supported. You only
-need to implement custom ops if you want **interior revocation** - the ability to
-invalidate a resource so that ALL holders of any fd to it see the revocation.
-
-### Interior Revocation (Opt-In)
-
-Interior revocation means the resource itself is invalidated, not just the coalition's
-reference. This is appropriate for:
-
-- **Processes**: SIGKILL kills the process; all procdescs see it as dead
-- **Jails**: prison_remove() destroys the jail; all jaildescs become invalid
-- **Sockets**: soshutdown() kills the connection; all socket fds get errors
-- **Custom resources**: Set a revoked flag; all operations fail
-
-For simple fd types (files, pipes), interior revocation isn't needed - closing
-the coalition's reference is sufficient.
-
 ### Implementing Custom Ops
 
 ```c
+static int your_dtype = DTYPE_NONE;
+
 static int
 your_terminate(struct file *fp, struct thread *td)
 {
     struct your_data *yd = fp->f_data;
 
-    /*
-     * Interior revocation: invalidate the resource itself.
-     * After this, ANY fd pointing to this resource should fail.
-     */
     YOUR_LOCK(yd);
     yd->revoked = true;
-    wakeup(yd);  /* Wake waiters so they see revocation */
+    wakeup(yd);
     YOUR_UNLOCK(yd);
-
     return (0);
 }
 
@@ -264,27 +211,24 @@ static struct vbsd_member_ops your_ops = {
     .mo_name      = "yourtype",
 };
 
-/* Register at module load */
-vbsd_member_ops_register(DTYPE_YOURTYPE, &your_ops);
-```
+/* At module load: register and get assigned dtype */
+if (vbsd_coalition_available()) {
+    error = vbsd_member_ops_register(&your_ops, &your_dtype);
+    if (error != 0)
+        return (error);
+}
 
-### Checking Revocation in Operations
-
-If you implement interior revocation, every operation must check:
-
-```c
+/* In d_fdopen: use the assigned dtype */
 static int
-your_do_operation(struct your_data *yd, ...)
+your_fdopen(struct cdev *dev, int oflags, struct thread *td, struct file *fp)
 {
-    YOUR_LOCK(yd);
-    if (yd->revoked) {
-        YOUR_UNLOCK(yd);
-        return (EBADF);
-    }
-    /* ... do the operation ... */
-    YOUR_UNLOCK(yd);
+    struct your_data *yd = your_alloc();
+    finit(fp, FREAD | FWRITE, your_dtype, yd, &your_fileops);
     return (0);
 }
+
+/* At module unload */
+vbsd_member_ops_deregister(your_dtype);
 ```
 
 ## Handling Natural Exit
@@ -308,44 +252,6 @@ Handled via prison OSD destructor:
 These don't have natural exit events:
 - Stay enlisted until coalition closes
 - mo_terminate called, then fdrop()
-
-## Capability Restriction Pattern (Optional)
-
-This pattern is useful when you want workers to use a resource but not be able to
-revoke it directly. The supervisor holds revocation authority via the coalition.
-
-**The pattern:**
-1. Create resource with full capabilities
-2. Duplicate the fd
-3. Restrict the duplicate (remove direct revoke capability)
-4. Enlist the original in a coalition
-5. Pass the restricted fd to worker
-
-**Example restriction ioctl:**
-
-```c
-#define YOUR_IOC_RESTRICT    _IOW('Y', 1, uint32_t)
-
-#define YOUR_CAP_READ        0x0001
-#define YOUR_CAP_WRITE       0x0002
-#define YOUR_CAP_REVOKE      0x0004  /* Direct revoke via ioctl */
-#define YOUR_CAP_ALL         0x0007
-
-static int
-your_ioctl_restrict(struct your_data *yd, uint32_t newcaps)
-{
-    /* Can only remove capabilities, never add */
-    if ((newcaps & ~yd->caps) != 0)
-        return (ENOTCAPABLE);
-
-    yd->caps = newcaps;
-    return (0);
-}
-```
-
-**Note:** The coalition bypasses capability restrictions - it calls mo_terminate
-directly in kernel space. This is intentional: the supervisor holds revocation
-authority via the coalition, not via the fd's capabilities.
 
 ## Lock Order
 
@@ -392,28 +298,7 @@ The coalition module registers ops for these types at load:
 | DTYPE_INOTIFY | Inotify | no-op | No |
 | DTYPE_DEV | Device | no-op | No (custom ops can override) |
 
-### Interior Revocation
-
-Types with interior revocation invalidate the resource for ALL holders:
-- **Process**: SIGKILL kills the process; all procdescs see zombie
-- **Jail**: prison_remove destroys the jail; all jaildescs become invalid
-- **Socket**: soshutdown kills the connection; all socket fds get errors
-- **SHM**: truncate to 0; any access to mapped region triggers SIGBUS
-
-Types without interior revocation just have their coalition reference dropped.
-Other holders are unaffected.
-
-**DTYPE_DEV** is registered with default (no-op) ops. Device drivers that want
-interior revocation can register their own ops at module load time.
-
-### Fallback Behavior
-
-Any fd type can be enlisted. Types without registered ops use default behavior:
-- Terminate: no-op (just close the fd)
-- The coalition holds a reference via `fhold()` and releases via `fdrop()` on close
-
-External modules can register custom ops using `vbsd_member_ops_register()` for
-types that need interior revocation (invalidating the resource for all holders).
+Types without registered ops use default no-op behavior. External modules register custom ops via `vbsd_member_ops_register()`.
 
 ## Nested Coalitions
 
@@ -658,7 +543,7 @@ SecurityCoalitions/
 | Multiple jails | `test_enlist_multiple_jails` | multiple jails |
 | Jail after terminate | `test_enlist_jail_after_terminate_fails` | EINVAL |
 | Terminate removes jails | `test_terminate_removes_jails` | jails removed |
-| Jail fork inheritance | `test_jail_fork_inheritance` | child inherits |
+| Jail terminate kills procs | `test_jail_terminate_kills_processes` | processes killed |
 | Socket shutdown | `test_socket_shutdown_on_terminate` | socket shutdown |
 | SHM truncate | `test_shm_truncate_on_terminate` | SHM size 0 |
 | Device enlistment | `test_enlist_device` | success |
@@ -876,7 +761,7 @@ dtrace -n 'coalition:::enlist__set {
 | 13 | `DTYPE_PROCDESC` | Process descriptor |
 | 20 | `DTYPE_DEV` | Device |
 | 23 | `DTYPE_JAILDESC` | Jail descriptor |
-| 32+ | Custom | External module types |
+| 64+ | Custom | External module types (assigned by coalition) |
 
 ## Limitations
 

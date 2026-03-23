@@ -70,11 +70,8 @@ static struct fileops keyvault_fileops = {
  * ======================================================================== */
 
 /*
- * Coalition terminate callback.
- *
- * Called when a coalition containing this keyvault is terminated.
- * This implements "interior revocation" - ALL holders of any fd
- * pointing to this keyvault will see it as revoked.
+ * Coalition terminate callback - securely zeros all keys when
+ * the coalition containing this keyvault is terminated.
  */
 static int
 keyvault_coalition_terminate(struct file *fp, struct thread *td __unused)
@@ -82,17 +79,13 @@ keyvault_coalition_terminate(struct file *fp, struct thread *td __unused)
 	struct keyvault *kv;
 	int i;
 
-	KASSERT(fp != NULL, ("keyvault_coalition_terminate: NULL fp"));
-	KASSERT(fp->f_data != NULL, ("keyvault_coalition_terminate: NULL f_data"));
+	if (fp == NULL || fp->f_data == NULL)
+		return (EINVAL);
 
 	kv = fp->f_data;
 
 	KEYVAULT_LOCK(kv);
-
-	/* Mark as revoked - all future operations will fail */
 	kv->kv_revoked = true;
-
-	/* Securely zero all key material */
 	for (i = 0; i < KEYVAULT_MAX_SLOTS; i++) {
 		if (kv->kv_slots[i].ks_valid) {
 			explicit_bzero(kv->kv_slots[i].ks_data,
@@ -101,13 +94,9 @@ keyvault_coalition_terminate(struct file *fp, struct thread *td __unused)
 			kv->kv_slots[i].ks_len = 0;
 		}
 	}
-
-	/* Wake up any threads waiting on this keyvault */
 	wakeup(kv);
-
 	KEYVAULT_UNLOCK(kv);
 
-	log(LOG_INFO, "keyvault: revoked by coalition termination\n");
 	return (0);
 }
 
@@ -313,6 +302,9 @@ keyvault_fo_close(struct file *fp, struct thread *td __unused)
  * Device Operations
  * ======================================================================== */
 
+/* Assigned by coalition module at registration */
+static int keyvault_dtype = DTYPE_NONE;
+
 static int
 keyvault_fdopen(struct cdev *dev __unused, int oflags __unused,
     struct thread *td __unused, struct file *fp)
@@ -320,7 +312,7 @@ keyvault_fdopen(struct cdev *dev __unused, int oflags __unused,
 	struct keyvault *kv;
 
 	kv = keyvault_alloc();
-	finit(fp, FREAD | FWRITE, DTYPE_KEYVAULT, kv, &keyvault_fileops);
+	finit(fp, FREAD | FWRITE, keyvault_dtype, kv, &keyvault_fileops);
 
 	return (0);
 }
@@ -335,13 +327,10 @@ static struct cdevsw keyvault_cdevsw = {
  * Module Init/Fini
  * ======================================================================== */
 
-static bool keyvault_coalition_registered;
-
 static int
 keyvault_modevent(module_t mod __unused, int type, void *arg __unused)
 {
 	int error;
-	bool coalition_loaded;
 
 	switch (type) {
 	case MOD_LOAD:
@@ -349,55 +338,33 @@ keyvault_modevent(module_t mod __unused, int type, void *arg __unused)
 		    sizeof(struct keyvault), NULL, NULL, NULL, NULL,
 		    UMA_ALIGN_PTR, 0);
 
-		/*
-		 * Register with coalition system (OPTIONAL).
-		 * Only register if vbsd_coalition is loaded.
-		 */
-		coalition_loaded = vbsd_coalition_available();
-		if (coalition_loaded) {
-			error = vbsd_member_ops_register(DTYPE_KEYVAULT,
-			    &keyvault_coalition_ops);
-			if (error != 0 && error != EEXIST) {
+		/* Register with coalition - get assigned dtype */
+		if (vbsd_coalition_available()) {
+			error = vbsd_member_ops_register(&keyvault_coalition_ops,
+			    &keyvault_dtype);
+			if (error != 0) {
 				log(LOG_WARNING,
-				    "keyvault: coalition registration failed: %d\n",
+				    "keyvault: coalition register failed: %d\n",
 				    error);
-				keyvault_coalition_registered = false;
-			} else {
-				keyvault_coalition_registered = true;
+				uma_zdestroy(keyvault_zone);
+				return (error);
 			}
-		} else {
-			keyvault_coalition_registered = false;
 		}
 
 		keyvault_dev = make_dev(&keyvault_cdevsw, 0,
 		    UID_ROOT, GID_WHEEL, 0600, "keyvault");
 		if (keyvault_dev == NULL) {
-			if (keyvault_coalition_registered)
-				vbsd_member_ops_deregister(DTYPE_KEYVAULT);
+			vbsd_member_ops_deregister(keyvault_dtype);
 			uma_zdestroy(keyvault_zone);
 			return (ENXIO);
 		}
 
-		log(LOG_INFO, "keyvault: loaded%s\n",
-		    keyvault_coalition_registered ? " (coalition enabled)" : "");
+		log(LOG_INFO, "keyvault: loaded (dtype %d)\n", keyvault_dtype);
 		return (0);
 
 	case MOD_UNLOAD:
 		destroy_dev(keyvault_dev);
-
-		/*
-		 * Deregister from coalition if we registered.
-		 * Returns EBUSY if keyvaults are still enlisted,
-		 * but we've already destroyed the device so continue.
-		 */
-		if (keyvault_coalition_registered) {
-			error = vbsd_member_ops_deregister(DTYPE_KEYVAULT);
-			if (error == EBUSY) {
-				log(LOG_WARNING,
-				    "keyvault: unloading with enlisted vaults\n");
-			}
-		}
-
+		vbsd_member_ops_deregister(keyvault_dtype);
 		uma_zdestroy(keyvault_zone);
 		return (0);
 

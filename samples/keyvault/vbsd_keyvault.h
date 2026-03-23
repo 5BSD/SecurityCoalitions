@@ -49,13 +49,9 @@ struct keyvault_key {
 #include <sys/mutex.h>
 
 /*
- * Define our own DTYPE if not in sys/file.h yet.
- * External modules should use DTYPEs 32-255.
- * (0-31 reserved for FreeBSD official types)
+ * DTYPE is assigned dynamically by vbsd_coalition at registration.
+ * No need for a static define - coalition manages dtype allocation.
  */
-#ifndef DTYPE_KEYVAULT
-#define DTYPE_KEYVAULT	32
-#endif
 
 /*
  * Key slot

@@ -109,7 +109,12 @@ struct vbsd_member_ops {
 	const char *mo_name;
 };
 
-int	vbsd_member_ops_register(int dtype, struct vbsd_member_ops *ops);
+/*
+ * Register ops for a new descriptor type. Coalition assigns the dtype.
+ * Returns 0 on success, dtype is stored in *dtype_out.
+ * Use the returned dtype in finit() when creating your descriptors.
+ */
+int	vbsd_member_ops_register(struct vbsd_member_ops *ops, int *dtype_out);
 int	vbsd_member_ops_deregister(int dtype);
 #ifdef _SYS_MODULE_H_
 static __inline bool
@@ -162,10 +167,6 @@ struct vbsd_member {
 	struct vbsd_coalition		*vm_coalition;
 	void				*vm_data;
 	int				vm_dtype;
-};
-
-struct vbsd_coalition_file {
-	struct vbsd_coalition		*vcf_coalition;
 };
 
 #endif /* _VBSD_COALITION_INTERNAL */

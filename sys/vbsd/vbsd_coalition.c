@@ -67,114 +67,107 @@ SDT_PROBE_DEFINE2(coalition, , , fork__inherit, "pid_t", "pid_t")
 
 MALLOC_DEFINE(M_VBSD_COALITION, "vbsd_coalition", "vBSD Coalition structures");
 
-/* Ops Registration Table */
-
-#define VBSD_OPS_TABLE_SIZE	256
-
-struct vbsd_ops_entry {
-	struct vbsd_member_ops	*ops;
-	volatile u_int		member_count;	/* Active members of this type */
-};
-
-/* Forward declaration for fallback ops */
+/* Forward declarations for ops */
+static struct vbsd_member_ops vbsd_proc_ops;
+static struct vbsd_member_ops vbsd_jail_ops;
+static struct vbsd_member_ops vbsd_socket_ops;
+static struct vbsd_member_ops vbsd_shm_ops;
 static struct vbsd_member_ops vbsd_default_ops;
 
-static struct vbsd_ops_entry vbsd_ops_table[VBSD_OPS_TABLE_SIZE];
-static struct mtx vbsd_ops_lock;
+/* Global member counter */
+static volatile u_int vbsd_member_count;
+
+/* External module ops registration (linked list, unlimited) */
+struct vbsd_external_ops {
+	LIST_ENTRY(vbsd_external_ops)	link;
+	int				dtype;
+	struct vbsd_member_ops		*ops;
+};
+
+static LIST_HEAD(, vbsd_external_ops) vbsd_external_ops_list =
+    LIST_HEAD_INITIALIZER(vbsd_external_ops_list);
+static struct mtx vbsd_external_ops_lock;
+static int vbsd_next_external_dtype = 64;	/* Start above kernel dtypes */
+#define VBSD_DTYPE_MAX	0x7fff			/* Reasonable upper bound */
 
 int
-vbsd_member_ops_register(int dtype, struct vbsd_member_ops *ops)
+vbsd_member_ops_register(struct vbsd_member_ops *ops, int *dtype_out)
 {
+	struct vbsd_external_ops *new_entry;
 
-	if (dtype < 0 || dtype >= VBSD_OPS_TABLE_SIZE)
-		return (EINVAL);
-	if (ops == NULL || ops->mo_terminate == NULL)
+	if (ops == NULL || ops->mo_terminate == NULL || dtype_out == NULL)
 		return (EINVAL);
 
-	mtx_lock(&vbsd_ops_lock);
-	if (vbsd_ops_table[dtype].ops != NULL) {
-		mtx_unlock(&vbsd_ops_lock);
-		return (EEXIST);
+	new_entry = malloc(sizeof(*new_entry), M_VBSD_COALITION, M_WAITOK);
+	new_entry->ops = ops;
+
+	mtx_lock(&vbsd_external_ops_lock);
+	if (vbsd_next_external_dtype >= VBSD_DTYPE_MAX) {
+		mtx_unlock(&vbsd_external_ops_lock);
+		free(new_entry, M_VBSD_COALITION);
+		return (ENOSPC);
 	}
-	vbsd_ops_table[dtype].member_count = 0;
-	atomic_store_rel_ptr((uintptr_t *)&vbsd_ops_table[dtype].ops,
-	    (uintptr_t)ops);
-	mtx_unlock(&vbsd_ops_lock);
+	new_entry->dtype = vbsd_next_external_dtype++;
+	LIST_INSERT_HEAD(&vbsd_external_ops_list, new_entry, link);
+	mtx_unlock(&vbsd_external_ops_lock);
 
-	log(LOG_INFO, "vbsd_coalition: registered ops for %s (dtype %d)\n",
-	    ops->mo_name, dtype);
+	*dtype_out = new_entry->dtype;
 	return (0);
 }
 
 int
 vbsd_member_ops_deregister(int dtype)
 {
+	struct vbsd_external_ops *entry;
 
-	if (dtype < 0 || dtype >= VBSD_OPS_TABLE_SIZE)
-		return (EINVAL);
-
-	mtx_lock(&vbsd_ops_lock);
-	if (vbsd_ops_table[dtype].member_count != 0) {
-		mtx_unlock(&vbsd_ops_lock);
-		return (EBUSY);
+	mtx_lock(&vbsd_external_ops_lock);
+	LIST_FOREACH(entry, &vbsd_external_ops_list, link) {
+		if (entry->dtype == dtype) {
+			LIST_REMOVE(entry, link);
+			mtx_unlock(&vbsd_external_ops_lock);
+			free(entry, M_VBSD_COALITION);
+			return (0);
+		}
 	}
-	vbsd_ops_table[dtype].ops = NULL;
-	mtx_unlock(&vbsd_ops_lock);
+	mtx_unlock(&vbsd_external_ops_lock);
 
-	return (0);
+	return (ENOENT);
 }
 
-/* Acquire ops for dtype, falls back to default_ops if unregistered */
+/* Get ops based on dtype - built-ins first, then external */
 static struct vbsd_member_ops *
-vbsd_member_ops_acquire(int dtype)
+vbsd_member_ops_get(int dtype)
 {
-	struct vbsd_member_ops *ops;
+	struct vbsd_external_ops *entry;
 
-	if (dtype < 0 || dtype >= VBSD_OPS_TABLE_SIZE)
-		return (NULL);
+	/* Built-in types */
+	switch (dtype) {
+	case DTYPE_PROCDESC:
+		return (&vbsd_proc_ops);
+	case DTYPE_JAILDESC:
+		return (&vbsd_jail_ops);
+	case DTYPE_SOCKET:
+		return (&vbsd_socket_ops);
+	case DTYPE_SHM:
+		return (&vbsd_shm_ops);
+	}
 
-	mtx_lock(&vbsd_ops_lock);
-	ops = vbsd_ops_table[dtype].ops;
-	if (ops == NULL)
-		ops = &vbsd_default_ops;  /* Fallback: just close on terminate */
-	vbsd_ops_table[dtype].member_count++;
-	mtx_unlock(&vbsd_ops_lock);
+	/* Check external registrations */
+	mtx_lock(&vbsd_external_ops_lock);
+	LIST_FOREACH(entry, &vbsd_external_ops_list, link) {
+		if (entry->dtype == dtype) {
+			mtx_unlock(&vbsd_external_ops_lock);
+			return (entry->ops);
+		}
+	}
+	mtx_unlock(&vbsd_external_ops_lock);
 
-	return (ops);
-}
-
-static void
-vbsd_member_ops_release(int dtype)
-{
-
-	KASSERT(dtype >= 0 && dtype < VBSD_OPS_TABLE_SIZE,
-	    ("vbsd_member_ops_release: bad dtype %d", dtype));
-
-	mtx_lock(&vbsd_ops_lock);
-	KASSERT(vbsd_ops_table[dtype].member_count > 0,
-	    ("vbsd_member_ops_release: underflow for dtype %d", dtype));
-	vbsd_ops_table[dtype].member_count--;
-	mtx_unlock(&vbsd_ops_lock);
-}
-
-static void
-vbsd_member_count_inc_builtin(int dtype)
-{
-
-	KASSERT(dtype >= 0 && dtype < VBSD_OPS_TABLE_SIZE,
-	    ("vbsd_member_count_inc_builtin: bad dtype %d", dtype));
-
-	mtx_lock(&vbsd_ops_lock);
-	KASSERT(vbsd_ops_table[dtype].ops != NULL,
-	    ("vbsd_member_count_inc_builtin: no ops for dtype %d", dtype));
-	vbsd_ops_table[dtype].member_count++;
-	mtx_unlock(&vbsd_ops_lock);
+	return (&vbsd_default_ops);
 }
 
 /* UMA Zones and Global State */
 
 static uma_zone_t vbsd_coalition_zone;
-static uma_zone_t vbsd_coalition_file_zone;
 static uma_zone_t vbsd_member_zone;
 
 static volatile u_int vbsd_coalition_count;
@@ -251,27 +244,14 @@ SYSCTL_UINT(_kern_coalition, OID_AUTO, enlist_set_max, CTLFLAG_RW,
     &vbsd_enlist_set_max, 0,
     "Maximum fds per VBSD_COALITION_ENLIST_SET call (default 1024)");
 
-static int
-sysctl_kern_coalition_members(SYSCTL_HANDLER_ARGS)
-{
-	u_int total, i;
-
-	total = 0;
-	for (i = 0; i < VBSD_OPS_TABLE_SIZE; i++)
-		total += atomic_load_acq_int(&vbsd_ops_table[i].member_count);
-
-	return (sysctl_handle_int(oidp, &total, 0, req));
-}
-
-SYSCTL_PROC(_kern_coalition, OID_AUTO, members,
-    CTLTYPE_UINT | CTLFLAG_RD | CTLFLAG_MPSAFE, NULL, 0,
-    sysctl_kern_coalition_members, "IU",
+SYSCTL_UINT(_kern_coalition, OID_AUTO, members, CTLFLAG_RD,
+    __DEVOLATILE(u_int *, &vbsd_member_count), 0,
     "Total members across all coalitions");
 
 static int
 vbsd_check_member_limits(struct vbsd_coalition *vc)
 {
-	u_int max, current, i;
+	u_int max, current;
 
 	max = vbsd_max_members_per_coalition;
 	if (max != 0) {
@@ -282,9 +262,7 @@ vbsd_check_member_limits(struct vbsd_coalition *vc)
 
 	max = vbsd_max_members;
 	if (max != 0) {
-		current = 0;
-		for (i = 0; i < VBSD_OPS_TABLE_SIZE; i++)
-			current += atomic_load_acq_int(&vbsd_ops_table[i].member_count);
+		current = atomic_load_acq_int(&vbsd_member_count);
 		if (current >= max)
 			return (ENOMEM);
 	}
@@ -293,9 +271,6 @@ vbsd_check_member_limits(struct vbsd_coalition *vc)
 }
 
 /* Built-in Process Ops */
-struct vbsd_proc_data {
-	struct proc	*vpd_proc;
-};
 
 static int
 vbsd_proc_terminate(struct file *fp, struct thread *td __unused)
@@ -328,9 +303,6 @@ static struct vbsd_member_ops vbsd_proc_ops = {
 };
 
 /* Built-in Jail Ops */
-struct vbsd_jail_data {
-	struct prison	*vjd_prison;
-};
 
 static int
 vbsd_jail_terminate(struct file *fp, struct thread *td __unused)
@@ -442,15 +414,12 @@ vbsd_is_coalition(struct file *fp)
 static int
 vbsd_nested_coalition_terminate(struct file *fp, struct thread *td)
 {
-	struct vbsd_coalition_file *vcf;
 	struct vbsd_coalition *vc;
 
-	KASSERT(fp != NULL, ("vbsd_nested_coalition_terminate: NULL fp"));
-	KASSERT(vbsd_is_coalition(fp),
-	    ("vbsd_nested_coalition_terminate: not a coalition"));
+	KASSERT(fp != NULL, ("NULL fp"));
+	KASSERT(vbsd_is_coalition(fp), ("not a coalition"));
 
-	vcf = fp->f_data;
-	vc = vcf->vcf_coalition;
+	vc = fp->f_data;
 
 	/*
 	 * Terminate the nested coalition. This cascades to all its
@@ -547,13 +516,9 @@ static struct filterops coalition_filtops = {
 static int
 vbsd_coalition_fo_kqfilter(struct file *fp, struct knote *kn)
 {
-	struct vbsd_coalition_file *vcf;
 	struct vbsd_coalition *vc;
 
-	vcf = fp->f_data;
-	if (vcf == NULL)
-		return (EBADF);
-	vc = vcf->vcf_coalition;
+	vc = fp->f_data;
 	if (vc == NULL)
 		return (EBADF);
 
@@ -771,7 +736,6 @@ static int
 vbsd_coalition_init_file(struct file *fp)
 {
 	struct vbsd_coalition *vc;
-	struct vbsd_coalition_file *vcf;
 	u_int max, current;
 
 	/* Check coalition count limit */
@@ -783,10 +747,7 @@ vbsd_coalition_init_file(struct file *fp)
 	}
 
 	vc = vbsd_coalition_alloc();
-	vcf = uma_zalloc(vbsd_coalition_file_zone, M_WAITOK | M_ZERO);
-	vcf->vcf_coalition = vc;
-
-	finit(fp, FREAD | FWRITE, DTYPE_DEV, vcf, &vbsd_coalition_fileops);
+	finit(fp, FREAD | FWRITE, DTYPE_DEV, vc, &vbsd_coalition_fileops);
 
 	SDT_PROBE1(coalition, , , create, curthread->td_proc->p_pid);
 
@@ -814,8 +775,7 @@ vbsd_proc_hash_lookup_locked(struct proc *p)
 	rw_assert(&vbsd_proc_hash_lock, RA_LOCKED);
 	idx = vbsd_proc_hash_index(p);
 	LIST_FOREACH(vm, &vbsd_proc_hash[idx], vm_hash) {
-		struct vbsd_proc_data *vpd = vm->vm_data;
-		if (vpd != NULL && vpd->vpd_proc == p)
+		if (vm->vm_data == p)
 			return (vm);
 	}
 	return (NULL);
@@ -896,14 +856,8 @@ vbsd_jail_osd_dtor(void *value)
 	vm = vjo->vjo_member;
 
 	if (vm != NULL) {
-		int dtype = vm->vm_dtype;
-		struct thread *td = curthread;
 		bool in_tailq;
 		bool was_leader = false;
-
-		KASSERT(td != NULL, ("vbsd_jail_osd_dtor: NULL curthread"));
-		KASSERT((td->td_pflags & TDP_ITHREAD) == 0,
-		    ("vbsd_jail_osd_dtor: called from interrupt thread"));
 
 		sx_xlock(&vc->vc_sx);
 		in_tailq = (vm->vm_link.tqe_prev != NULL);
@@ -927,15 +881,14 @@ vbsd_jail_osd_dtor(void *value)
 
 		if (in_tailq) {
 			atomic_subtract_int(&vc->vc_member_count, 1);
-			vbsd_member_ops_release(dtype);
+			atomic_subtract_int(&vbsd_member_count, 1);
 
-			/* Release file reference */
-			if (vm->vm_fp != NULL)
-				fdrop(vm->vm_fp, td);
-
-			/* Free member data and member struct */
-			if (vm->vm_data != NULL)
-				free(vm->vm_data, M_VBSD_COALITION);
+			/*
+			 * Don't fdrop the jaildesc here - we're inside the
+			 * prison destructor, and jaildesc_close would try to
+			 * access the prison which is being freed. The jaildesc
+			 * reference will be released when fo_close runs.
+			 */
 
 			uma_zfree(vbsd_member_zone, vm);
 
@@ -988,8 +941,7 @@ vbsd_coalition_enlist_generic(struct vbsd_coalition *vc, struct thread *td,
 	 */
 	is_nested_coalition = vbsd_is_coalition(fp);
 	if (is_nested_coalition) {
-		struct vbsd_coalition_file *nested_vcf = fp->f_data;
-		struct vbsd_coalition *nested_vc = nested_vcf->vcf_coalition;
+		struct vbsd_coalition *nested_vc = fp->f_data;
 
 		/*
 		 * Check nesting depth to prevent infinite loops.
@@ -1009,20 +961,15 @@ vbsd_coalition_enlist_generic(struct vbsd_coalition *vc, struct thread *td,
 		 */
 		ops = &vbsd_coalition_ops;
 	} else {
-		/*
-		 * Atomically acquire ops and increment member count.
-		 * This prevents race with deregistration.
-		 */
-		ops = vbsd_member_ops_acquire(dtype);
-		if (ops == NULL)
-			return (EOPNOTSUPP);
+		ops = vbsd_member_ops_get(dtype);
+		atomic_add_int(&vbsd_member_count, 1);
 	}
 
 	/* Check resource limits before allocating */
 	error = vbsd_check_member_limits(vc);
 	if (error != 0) {
 		if (!is_nested_coalition)
-			vbsd_member_ops_release(dtype);
+			atomic_subtract_int(&vbsd_member_count, 1);
 		return (error);
 	}
 
@@ -1032,7 +979,7 @@ vbsd_coalition_enlist_generic(struct vbsd_coalition *vc, struct thread *td,
 	 */
 	if (!fhold(fp)) {
 		if (!is_nested_coalition)
-			vbsd_member_ops_release(dtype);
+			atomic_subtract_int(&vbsd_member_count, 1);
 		return (EBADF);
 	}
 
@@ -1043,117 +990,84 @@ vbsd_coalition_enlist_generic(struct vbsd_coalition *vc, struct thread *td,
 	/* Type-specific setup */
 	if (dtype == DTYPE_PROCDESC) {
 		struct procdesc *pd = fp->f_data;
-		struct vbsd_proc_data *vpd;
 		struct proc *p;
-
-		vpd = malloc(sizeof(*vpd), M_VBSD_COALITION, M_WAITOK);
 
 		sx_slock(&proctree_lock);
 		p = pd->pd_proc;
 		if (p == NULL) {
 			sx_sunlock(&proctree_lock);
-			free(vpd, M_VBSD_COALITION);
 			uma_zfree(vbsd_member_zone, vm);
 			fdrop(fp, td);
-			vbsd_member_ops_release(dtype);
+			atomic_subtract_int(&vbsd_member_count, 1);
 			return (ESRCH);
 		}
-		vpd->vpd_proc = p;
 
-		/*
-		 * Take hash lock BEFORE releasing proctree_lock to close
-		 * the race window where process could exit between getting
-		 * the proc pointer and inserting into the hash table.
-		 * If we released proctree_lock first, the process could exit
-		 * (clearing pd->pd_proc), the exit handler wouldn't find us
-		 * in hash (not inserted yet), then we'd insert a stale entry.
-		 *
-		 * Lock order: proctree_lock -> hash_lock -> vc_sx
-		 */
+		/* Lock order: proctree_lock -> hash_lock -> vc_sx */
 		rw_wlock(&vbsd_proc_hash_lock);
 		sx_sunlock(&proctree_lock);
 
-		/* Check not already enlisted (any coalition) */
 		if (vbsd_proc_hash_lookup_locked(p) != NULL) {
 			rw_wunlock(&vbsd_proc_hash_lock);
-			free(vpd, M_VBSD_COALITION);
 			uma_zfree(vbsd_member_zone, vm);
 			fdrop(fp, td);
-			vbsd_member_ops_release(dtype);
+			atomic_subtract_int(&vbsd_member_count, 1);
 			return (EBUSY);
 		}
 
-		vm->vm_data = vpd;
+		vm->vm_data = p;
 
 		sx_xlock(&vc->vc_sx);
 		if (vc->vc_flags & VCF_TERMINATING) {
 			sx_xunlock(&vc->vc_sx);
 			rw_wunlock(&vbsd_proc_hash_lock);
-			free(vpd, M_VBSD_COALITION);
 			uma_zfree(vbsd_member_zone, vm);
 			fdrop(fp, td);
-			vbsd_member_ops_release(dtype);
+			atomic_subtract_int(&vbsd_member_count, 1);
 			return (EINVAL);
 		}
 
-		/* Insert into hash table for exit handler */
 		vbsd_proc_hash_insert_locked(vm, p);
 		rw_wunlock(&vbsd_proc_hash_lock);
 
 	} else if (dtype == DTYPE_JAILDESC) {
 		struct jaildesc *jd = fp->f_data;
-		struct vbsd_jail_data *vjd;
 		struct prison *pr;
 		int osd_error;
-
-		vjd = malloc(sizeof(*vjd), M_VBSD_COALITION, M_WAITOK);
 
 		JAILDESC_LOCK(jd);
 		pr = jd->jd_prison;
 		if (pr == NULL || !prison_isvalid(pr)) {
 			JAILDESC_UNLOCK(jd);
-			free(vjd, M_VBSD_COALITION);
 			uma_zfree(vbsd_member_zone, vm);
 			fdrop(fp, td);
-			vbsd_member_ops_release(dtype);
+			atomic_subtract_int(&vbsd_member_count, 1);
 			return (ENOENT);
 		}
 		prison_hold(pr);
 		JAILDESC_UNLOCK(jd);
 
-		vjd->vjd_prison = pr;
-		vm->vm_data = vjd;
+		vm->vm_data = pr;
 
 		sx_xlock(&vc->vc_sx);
 		if (vc->vc_flags & VCF_TERMINATING) {
 			sx_xunlock(&vc->vc_sx);
 			prison_free(pr);
-			free(vjd, M_VBSD_COALITION);
 			uma_zfree(vbsd_member_zone, vm);
 			fdrop(fp, td);
-			vbsd_member_ops_release(dtype);
+			atomic_subtract_int(&vbsd_member_count, 1);
 			return (EINVAL);
 		}
 
-		/*
-		 * Atomically set up OSD for fork inheritance.
-		 * This prevents TOCTOU race - the check and set are atomic.
-		 */
 		osd_error = vbsd_jail_set_coalition_atomic(pr, vc);
 		if (osd_error != 0) {
 			sx_xunlock(&vc->vc_sx);
 			prison_free(pr);
-			free(vjd, M_VBSD_COALITION);
 			uma_zfree(vbsd_member_zone, vm);
 			fdrop(fp, td);
-			vbsd_member_ops_release(dtype);
-			return (osd_error);  /* EBUSY if already enlisted */
+			atomic_subtract_int(&vbsd_member_count, 1);
+			return (osd_error);
 		}
-		vbsd_coalition_ref(vc);  /* OSD holds ref */
-		/*
-		 * Note: prison_free(pr) is deferred until after
-		 * vbsd_jail_set_member() to prevent use-after-free.
-		 */
+		vbsd_coalition_ref(vc);
 
 	} else {
 		/* Generic path for other types (sockets, shm, devices, coalitions, etc.) */
@@ -1163,7 +1077,7 @@ vbsd_coalition_enlist_generic(struct vbsd_coalition *vc, struct thread *td,
 			uma_zfree(vbsd_member_zone, vm);
 			fdrop(fp, td);
 			if (!is_nested_coalition)
-				vbsd_member_ops_release(dtype);
+				atomic_subtract_int(&vbsd_member_count, 1);
 			return (EINVAL);
 		}
 
@@ -1173,7 +1087,7 @@ vbsd_coalition_enlist_generic(struct vbsd_coalition *vc, struct thread *td,
 			uma_zfree(vbsd_member_zone, vm);
 			fdrop(fp, td);
 			if (!is_nested_coalition)
-				vbsd_member_ops_release(dtype);
+				atomic_subtract_int(&vbsd_member_count, 1);
 			return (EBUSY);
 		}
 
@@ -1181,8 +1095,7 @@ vbsd_coalition_enlist_generic(struct vbsd_coalition *vc, struct thread *td,
 		 * For nested coalitions, update the child's nesting depth.
 		 */
 		if (is_nested_coalition) {
-			struct vbsd_coalition_file *nested_vcf = fp->f_data;
-			struct vbsd_coalition *nested_vc = nested_vcf->vcf_coalition;
+			struct vbsd_coalition *nested_vc = fp->f_data;
 			nested_vc->vc_nesting_depth = vc->vc_nesting_depth + 1;
 		}
 	}
@@ -1199,9 +1112,9 @@ vbsd_coalition_enlist_generic(struct vbsd_coalition *vc, struct thread *td,
 	 * Then release the prison reference we've been holding.
 	 */
 	if (dtype == DTYPE_JAILDESC) {
-		struct vbsd_jail_data *vjd = vm->vm_data;
-		vbsd_jail_set_member(vjd->vjd_prison, vm);
-		prison_free(vjd->vjd_prison);
+		struct prison *pr = vm->vm_data;
+		vbsd_jail_set_member(pr, vm);
+		prison_free(pr);
 	}
 
 	atomic_add_int(&vc->vc_member_count, 1);
@@ -1221,26 +1134,20 @@ static int
 vbsd_coalition_join(struct vbsd_coalition *vc, struct thread *td)
 {
 	struct vbsd_member *vm;
-	struct vbsd_proc_data *vpd;
 	struct proc *p;
 	int error;
 
-	/* Check resource limits before allocating */
 	error = vbsd_check_member_limits(vc);
 	if (error != 0)
 		return (error);
 
 	p = td->td_proc;
-
 	vm = uma_zalloc(vbsd_member_zone, M_WAITOK | M_ZERO);
-	vpd = malloc(sizeof(*vpd), M_VBSD_COALITION, M_WAITOK);
-	vpd->vpd_proc = p;
 
 	rw_wlock(&vbsd_proc_hash_lock);
 
 	if (vbsd_proc_hash_lookup_locked(p) != NULL) {
 		rw_wunlock(&vbsd_proc_hash_lock);
-		free(vpd, M_VBSD_COALITION);
 		uma_zfree(vbsd_member_zone, vm);
 		return (EBUSY);
 	}
@@ -1250,22 +1157,21 @@ vbsd_coalition_join(struct vbsd_coalition *vc, struct thread *td)
 	if (vc->vc_flags & VCF_TERMINATING) {
 		sx_xunlock(&vc->vc_sx);
 		rw_wunlock(&vbsd_proc_hash_lock);
-		free(vpd, M_VBSD_COALITION);
 		uma_zfree(vbsd_member_zone, vm);
 		return (EINVAL);
 	}
 
-	vm->vm_data = vpd;
-	vm->vm_fp = NULL;  /* Self-join has no external file ref */
+	vm->vm_data = p;
+	vm->vm_fp = NULL;
 	vm->vm_ops = &vbsd_proc_ops;
 	vm->vm_coalition = vc;
-	vm->vm_dtype = DTYPE_PROCDESC;  /* Logically a process member */
+	vm->vm_dtype = DTYPE_PROCDESC;
 
 	vbsd_proc_hash_insert_locked(vm, p);
 	TAILQ_INSERT_TAIL(&vc->vc_members, vm, vm_link);
 
 	atomic_add_int(&vc->vc_member_count, 1);
-	vbsd_member_count_inc_builtin(DTYPE_PROCDESC);
+	atomic_add_int(&vbsd_member_count, 1);
 
 	/* Notify kqueue watchers of new member */
 	KNOTE_LOCKED(&vc->vc_knlist, VBSD_NOTE_MEMBER_ADDED);
@@ -1312,11 +1218,10 @@ vbsd_coalition_terminate_members_locked(struct vbsd_coalition *vc,
 		if (vm->vm_fp != NULL && vm->vm_ops->mo_terminate != NULL) {
 			(void)vm->vm_ops->mo_terminate(vm->vm_fp, td);
 		} else if (vm->vm_data != NULL && vm->vm_ops == &vbsd_proc_ops) {
-			struct vbsd_proc_data *vpd = vm->vm_data;
 			struct proc *p;
 
 			p = (struct proc *)atomic_load_acq_ptr(
-			    (uintptr_t *)&vpd->vpd_proc);
+			    (uintptr_t *)&vm->vm_data);
 			if (skip_self && self != NULL && p == self)
 				continue;
 			if (p != NULL) {
@@ -1462,15 +1367,10 @@ vbsd_coalition_signal_processes_locked(struct vbsd_coalition *vc, int sig)
 				sx_sunlock(&proctree_lock);
 			}
 		} else if (vm->vm_data != NULL) {
-			/*
-			 * Self-joined process - use atomic read of vpd_proc.
-			 * Exit handler atomically NULLs it when process exits.
-			 */
-			struct vbsd_proc_data *vpd = vm->vm_data;
 			struct proc *p;
 
 			p = (struct proc *)atomic_load_acq_ptr(
-			    (uintptr_t *)&vpd->vpd_proc);
+			    (uintptr_t *)&vm->vm_data);
 			if (p != NULL) {
 				PROC_LOCK(p);
 				kern_psignal(p, sig);
@@ -1503,15 +1403,10 @@ vbsd_coalition_count_live_processes_locked(struct vbsd_coalition *vc)
 				count++;
 			sx_sunlock(&proctree_lock);
 		} else if (vm->vm_data != NULL) {
-			/*
-			 * Self-joined process - use atomic read of vpd_proc.
-			 * Exit handler atomically NULLs it when process exits.
-			 */
-			struct vbsd_proc_data *vpd = vm->vm_data;
 			struct proc *p;
 
 			p = (struct proc *)atomic_load_acq_ptr(
-			    (uintptr_t *)&vpd->vpd_proc);
+			    (uintptr_t *)&vm->vm_data);
 			if (p != NULL && (p->p_flag & P_WEXIT) == 0)
 				count++;
 		}
@@ -1577,7 +1472,6 @@ vbsd_process_exit(void *arg __unused, struct proc *p)
 {
 	struct vbsd_member *vm;
 	struct vbsd_coalition *vc;
-	struct vbsd_proc_data *vpd;
 
 	rw_wlock(&vbsd_proc_hash_lock);
 	vm = vbsd_proc_hash_lookup_locked(p);
@@ -1593,15 +1487,12 @@ vbsd_process_exit(void *arg __unused, struct proc *p)
 	LIST_REMOVE(vm, vm_hash);
 	vm->vm_hash.le_prev = NULL;
 
-	/* NULL out cached proc pointer for self-joined processes */
-	if (vm->vm_fp == NULL && vm->vm_data != NULL) {
-		vpd = vm->vm_data;
-		atomic_store_rel_ptr((uintptr_t *)&vpd->vpd_proc, (uintptr_t)NULL);
-	}
+	/* NULL out proc pointer for self-joined processes */
+	if (vm->vm_fp == NULL)
+		atomic_store_rel_ptr((uintptr_t *)&vm->vm_data, (uintptr_t)NULL);
 
 	rw_wunlock(&vbsd_proc_hash_lock);
 
-	/* Leave member in list for fo_close cleanup */
 	if ((vc->vc_flags & VCF_HAS_LEADER) && p->p_pid == vc->vc_leader_pid) {
 		SDT_PROBE1(coalition, , , leader__exit, p->p_pid);
 		vbsd_coalition_terminate(vc);
@@ -1617,10 +1508,8 @@ vbsd_process_fork(void *arg __unused, struct proc *parent, struct proc *child,
     int flags __unused)
 {
 	struct vbsd_member *pvm, *cvm;
-	struct vbsd_proc_data *vpd;
 	struct vbsd_coalition *vc;
 
-	/* Only inherit if parent is directly enlisted in a coalition */
 	rw_rlock(&vbsd_proc_hash_lock);
 	pvm = vbsd_proc_hash_lookup_locked(parent);
 	if (pvm == NULL) {
@@ -1631,25 +1520,10 @@ vbsd_process_fork(void *arg __unused, struct proc *parent, struct proc *child,
 	vbsd_coalition_ref(vc);
 	rw_runlock(&vbsd_proc_hash_lock);
 
-	/*
-	 * Check resource limits but don't fail - fork inheritance is
-	 * security-critical.  Log warning if over limit but proceed.
-	 */
-	if (vbsd_check_member_limits(vc) != 0) {
-		log(LOG_WARNING,
-		    "vbsd_coalition: fork inheritance exceeds resource limits\n");
-	}
+	if (vbsd_check_member_limits(vc) != 0)
+		log(LOG_WARNING, "vbsd_coalition: fork exceeds limits\n");
 
-	/*
-	 * Use M_WAITOK to ensure child always inherits coalition membership.
-	 * Allocation failure would allow child to escape supervision - this
-	 * is a security violation.  M_WAITOK is safe here as we're in
-	 * process context (fork handler).
-	 */
 	cvm = uma_zalloc(vbsd_member_zone, M_WAITOK | M_ZERO);
-	vpd = malloc(sizeof(*vpd), M_VBSD_COALITION, M_WAITOK);
-
-	vpd->vpd_proc = child;
 
 	rw_wlock(&vbsd_proc_hash_lock);
 	sx_xlock(&vc->vc_sx);
@@ -1657,13 +1531,12 @@ vbsd_process_fork(void *arg __unused, struct proc *parent, struct proc *child,
 	if (vc->vc_flags & VCF_TERMINATING) {
 		sx_xunlock(&vc->vc_sx);
 		rw_wunlock(&vbsd_proc_hash_lock);
-		free(vpd, M_VBSD_COALITION);
 		uma_zfree(vbsd_member_zone, cvm);
 		vbsd_coalition_rel(vc);
 		return;
 	}
 
-	cvm->vm_data = vpd;
+	cvm->vm_data = child;
 	cvm->vm_fp = NULL;
 	cvm->vm_ops = &vbsd_proc_ops;
 	cvm->vm_coalition = vc;
@@ -1673,15 +1546,13 @@ vbsd_process_fork(void *arg __unused, struct proc *parent, struct proc *child,
 	TAILQ_INSERT_TAIL(&vc->vc_members, cvm, vm_link);
 
 	atomic_add_int(&vc->vc_member_count, 1);
-	vbsd_member_count_inc_builtin(DTYPE_PROCDESC);
-
+	atomic_add_int(&vbsd_member_count, 1);
 	vbsd_coalition_ref(vc);
 
 	sx_xunlock(&vc->vc_sx);
 	rw_wunlock(&vbsd_proc_hash_lock);
 
 	SDT_PROBE2(coalition, , , fork__inherit, parent->p_pid, child->p_pid);
-
 	vbsd_coalition_rel(vc);
 }
 
@@ -1691,13 +1562,11 @@ static int
 vbsd_coalition_fo_ioctl(struct file *fp, u_long cmd, void *data,
     struct ucred *active_cred __unused, struct thread *td)
 {
-	struct vbsd_coalition_file *vcf;
 	struct vbsd_coalition *vc;
 	struct file *target_fp;
 	int error, target_fd;
 
-	vcf = fp->f_data;
-	vc = vcf->vcf_coalition;
+	vc = fp->f_data;
 
 	switch (cmd) {
 	case VBSD_COALITION_ENLIST:
@@ -2034,13 +1903,10 @@ vbsd_coalition_fo_ioctl(struct file *fp, u_long cmd, void *data,
 				if (vc->vc_leader != NULL &&
 				    vc->vc_leader->vm_ops == &vbsd_coalition_ops &&
 				    vc->vc_leader->vm_fp != NULL) {
-					struct vbsd_coalition_file *old_vcf;
 					struct vbsd_coalition *old_child;
 
-					old_vcf = vc->vc_leader->vm_fp->f_data;
-					if (old_vcf != NULL &&
-					    old_vcf->vcf_coalition != NULL) {
-						old_child = old_vcf->vcf_coalition;
+					old_child = vc->vc_leader->vm_fp->f_data;
+					if (old_child != NULL) {
 						sx_xlock(&old_child->vc_sx);
 						old_child->vc_leader_of = NULL;
 						sx_xunlock(&old_child->vc_sx);
@@ -2113,18 +1979,15 @@ vbsd_coalition_fo_ioctl(struct file *fp, u_long cmd, void *data,
 				vc->vc_flags |= VCF_HAS_LEADER;
 			} else if (vm->vm_ops == &vbsd_coalition_ops) {
 				/* Nested coalition leader */
-				struct vbsd_coalition_file *child_vcf;
 				struct vbsd_coalition *child_vc;
 
-				child_vcf = target_fp->f_data;
-				if (child_vcf == NULL ||
-				    child_vcf->vcf_coalition == NULL) {
+				child_vc = target_fp->f_data;
+				if (child_vc == NULL) {
 					fdrop(target_fp, td);
 					sx_xunlock(&vc->vc_sx);
 					error = EINVAL;
 					break;
 				}
-				child_vc = child_vcf->vcf_coalition;
 
 				/*
 				 * Set back-pointer so child can notify us
@@ -2158,7 +2021,6 @@ vbsd_coalition_fo_ioctl(struct file *fp, u_long cmd, void *data,
 		{
 			struct vbsd_coalition_rusage *ru;
 			struct vbsd_member *vm;
-			struct vbsd_proc_data *vpd;
 			struct proc *p;
 			struct kinfo_proc kp;
 
@@ -2168,29 +2030,20 @@ vbsd_coalition_fo_ioctl(struct file *fp, u_long cmd, void *data,
 			sx_slock(&vc->vc_sx);
 
 			TAILQ_FOREACH(vm, &vc->vc_members, vm_link) {
-				/*
-				 * Handle direct process members
-				 */
 				if (vm->vm_ops == &vbsd_proc_ops) {
-					/*
-					 * Get the proc pointer. For enlisted processes,
-					 * use the procdesc. For self-joined, use vpd.
-					 */
 					p = NULL;
 					if (vm->vm_fp != NULL) {
 						struct procdesc *pd = vm->vm_fp->f_data;
 						if (pd != NULL)
 							p = pd->pd_proc;
 					} else if (vm->vm_data != NULL) {
-						vpd = vm->vm_data;
 						p = (struct proc *)atomic_load_acq_ptr(
-						    (uintptr_t *)&vpd->vpd_proc);
+						    (uintptr_t *)&vm->vm_data);
 					}
 
 					if (p == NULL)
 						continue;
 
-					/* Skip zombies and exiting processes */
 					PROC_LOCK(p);
 					if (p->p_state == PRS_ZOMBIE ||
 					    (p->p_flag & P_WEXIT)) {
@@ -2298,15 +2151,11 @@ vbsd_coalition_fo_ioctl(struct file *fp, u_long cmd, void *data,
 				if (vm->vm_ops == &vbsd_coalition_ops &&
 				    vm->vm_fp != NULL &&
 				    vbsd_is_coalition(vm->vm_fp)) {
-					struct vbsd_coalition_file *child_vcf;
 					struct vbsd_coalition *child_vc;
 					struct vbsd_coalition_rusage child_ru;
 					struct vbsd_member *child_vm;
 
-					child_vcf = vm->vm_fp->f_data;
-					if (child_vcf == NULL)
-						continue;
-					child_vc = child_vcf->vcf_coalition;
+					child_vc = vm->vm_fp->f_data;
 					if (child_vc == NULL)
 						continue;
 
@@ -2331,10 +2180,9 @@ vbsd_coalition_fo_ioctl(struct file *fp, u_long cmd, void *data,
 							if (pd != NULL)
 								p = pd->pd_proc;
 						} else if (child_vm->vm_data != NULL) {
-							vpd = child_vm->vm_data;
 							p = (struct proc *)
 							    atomic_load_acq_ptr(
-							    (uintptr_t *)&vpd->vpd_proc);
+							    (uintptr_t *)&child_vm->vm_data);
 						}
 
 						if (p == NULL)
@@ -2408,20 +2256,14 @@ vbsd_coalition_fo_ioctl(struct file *fp, u_long cmd, void *data,
 static int
 vbsd_coalition_fo_close(struct file *fp, struct thread *td)
 {
-	struct vbsd_coalition_file *vcf;
 	struct vbsd_coalition *vc;
 	struct vbsd_member *vm, *vm_temp;
 	u_int member_count __unused;
 
-	vcf = fp->f_data;
-	if (vcf == NULL)
+	vc = fp->f_data;
+	if (vc == NULL)
 		return (0);
 	fp->f_data = NULL;
-	vc = vcf->vcf_coalition;
-	if (vc == NULL) {
-		uma_zfree(vbsd_coalition_file_zone, vcf);
-		return (0);
-	}
 
 	/* Drain pending callouts/tasks before acquiring vc_sx to avoid deadlock */
 	callout_drain(&vc->vc_deadline_callout);
@@ -2517,15 +2359,10 @@ vbsd_coalition_fo_close(struct file *fp, struct thread *td)
 		 * vbsd_coalition_ops directly without calling ops_acquire.
 		 */
 		if (vm->vm_ops != &vbsd_coalition_ops)
-			vbsd_member_ops_release(vm->vm_dtype);
+			atomic_subtract_int(&vbsd_member_count, 1);
 
-		/* Release file reference */
 		if (vm->vm_fp != NULL)
 			fdrop(vm->vm_fp, td);
-
-		/* Free type-specific data */
-		if (vm->vm_data != NULL)
-			free(vm->vm_data, M_VBSD_COALITION);
 
 		uma_zfree(vbsd_member_zone, vm);
 		vbsd_coalition_rel(vc);
@@ -2581,15 +2418,11 @@ vbsd_coalition_fo_close(struct file *fp, struct thread *td)
 			(void)vm->vm_ops->mo_terminate(vm->vm_fp, td);
 
 		atomic_subtract_int(&vc->vc_member_count, 1);
-		vbsd_member_ops_release(vm->vm_dtype);
+		atomic_subtract_int(&vbsd_member_count, 1);
 
 		/* Release file reference */
 		if (vm->vm_fp != NULL)
 			fdrop(vm->vm_fp, td);
-
-		/* Free type-specific data */
-		if (vm->vm_data != NULL)
-			free(vm->vm_data, M_VBSD_COALITION);
 
 		uma_zfree(vbsd_member_zone, vm);
 		vbsd_coalition_rel(vc);
@@ -2598,7 +2431,6 @@ vbsd_coalition_fo_close(struct file *fp, struct thread *td)
 	}
 
 	vbsd_coalition_rel(vc);
-	uma_zfree(vbsd_coalition_file_zone, vcf);
 	return (0);
 }
 
@@ -2678,124 +2510,18 @@ vbsd_eventhandler_fini(void)
 }
 
 static int
-vbsd_register_builtins(void)
-{
-	int error;
-
-	mtx_init(&vbsd_ops_lock, "vbsd_ops", NULL, MTX_DEF);
-
-	/* Register process and jail ops (custom terminate behavior) */
-	error = vbsd_member_ops_register(DTYPE_PROCDESC, &vbsd_proc_ops);
-	if (error != 0)
-		goto fail;
-
-	error = vbsd_member_ops_register(DTYPE_JAILDESC, &vbsd_jail_ops);
-	if (error != 0)
-		goto fail;
-
-	/* Register built-in generic types (just close on terminate) */
-	error = vbsd_member_ops_register(DTYPE_VNODE, &vbsd_default_ops);
-	if (error != 0)
-		goto fail;
-
-	error = vbsd_member_ops_register(DTYPE_SOCKET, &vbsd_socket_ops);
-	if (error != 0)
-		goto fail;
-
-	error = vbsd_member_ops_register(DTYPE_PIPE, &vbsd_default_ops);
-	if (error != 0)
-		goto fail;
-
-	error = vbsd_member_ops_register(DTYPE_FIFO, &vbsd_default_ops);
-	if (error != 0)
-		goto fail;
-
-	error = vbsd_member_ops_register(DTYPE_SHM, &vbsd_shm_ops);
-	if (error != 0)
-		goto fail;
-
-	error = vbsd_member_ops_register(DTYPE_SEM, &vbsd_default_ops);
-	if (error != 0)
-		goto fail;
-
-	error = vbsd_member_ops_register(DTYPE_KQUEUE, &vbsd_default_ops);
-	if (error != 0)
-		goto fail;
-
-	error = vbsd_member_ops_register(DTYPE_EVENTFD, &vbsd_default_ops);
-	if (error != 0)
-		goto fail;
-
-	error = vbsd_member_ops_register(DTYPE_TIMERFD, &vbsd_default_ops);
-	if (error != 0)
-		goto fail;
-
-	error = vbsd_member_ops_register(DTYPE_INOTIFY, &vbsd_default_ops);
-	if (error != 0)
-		goto fail;
-
-	error = vbsd_member_ops_register(DTYPE_DEV, &vbsd_default_ops);
-	if (error != 0)
-		goto fail;
-
-	return (0);
-
-fail:
-	/* Clean up any registered ops on failure */
-	vbsd_member_ops_deregister(DTYPE_PROCDESC);
-	vbsd_member_ops_deregister(DTYPE_JAILDESC);
-	vbsd_member_ops_deregister(DTYPE_VNODE);
-	vbsd_member_ops_deregister(DTYPE_SOCKET);
-	vbsd_member_ops_deregister(DTYPE_PIPE);
-	vbsd_member_ops_deregister(DTYPE_FIFO);
-	vbsd_member_ops_deregister(DTYPE_SHM);
-	vbsd_member_ops_deregister(DTYPE_SEM);
-	vbsd_member_ops_deregister(DTYPE_KQUEUE);
-	vbsd_member_ops_deregister(DTYPE_EVENTFD);
-	vbsd_member_ops_deregister(DTYPE_TIMERFD);
-	vbsd_member_ops_deregister(DTYPE_INOTIFY);
-	vbsd_member_ops_deregister(DTYPE_DEV);
-	mtx_destroy(&vbsd_ops_lock);
-	return (error);
-}
-
-static void
-vbsd_deregister_builtins(void)
-{
-	vbsd_member_ops_deregister(DTYPE_PROCDESC);
-	vbsd_member_ops_deregister(DTYPE_JAILDESC);
-	vbsd_member_ops_deregister(DTYPE_VNODE);
-	vbsd_member_ops_deregister(DTYPE_SOCKET);
-	vbsd_member_ops_deregister(DTYPE_PIPE);
-	vbsd_member_ops_deregister(DTYPE_FIFO);
-	vbsd_member_ops_deregister(DTYPE_SHM);
-	vbsd_member_ops_deregister(DTYPE_SEM);
-	vbsd_member_ops_deregister(DTYPE_KQUEUE);
-	vbsd_member_ops_deregister(DTYPE_EVENTFD);
-	vbsd_member_ops_deregister(DTYPE_TIMERFD);
-	vbsd_member_ops_deregister(DTYPE_INOTIFY);
-	vbsd_member_ops_deregister(DTYPE_DEV);
-	mtx_destroy(&vbsd_ops_lock);
-}
-
-static int
 vbsd_coalition_mod_init(void)
 {
 	int error;
 
+	mtx_init(&vbsd_external_ops_lock, "vbsd_ext_ops", NULL, MTX_DEF);
+
 	vbsd_coalition_zone = uma_zcreate("vbsd_coalition",
 	    sizeof(struct vbsd_coalition), NULL, NULL, NULL, NULL,
-	    UMA_ALIGN_PTR, 0);
-	vbsd_coalition_file_zone = uma_zcreate("vbsd_coalition_file",
-	    sizeof(struct vbsd_coalition_file), NULL, NULL, NULL, NULL,
 	    UMA_ALIGN_PTR, 0);
 	vbsd_member_zone = uma_zcreate("vbsd_member",
 	    sizeof(struct vbsd_member), NULL, NULL, NULL, NULL,
 	    UMA_ALIGN_PTR, 0);
-
-	error = vbsd_register_builtins();
-	if (error != 0)
-		goto fail_ops;
 
 	error = vbsd_proc_hash_init();
 	if (error != 0)
@@ -2826,11 +2552,9 @@ fail_event:
 fail_osd:
 	vbsd_proc_hash_fini();
 fail_hash:
-	vbsd_deregister_builtins();
-fail_ops:
 	uma_zdestroy(vbsd_member_zone);
-	uma_zdestroy(vbsd_coalition_file_zone);
 	uma_zdestroy(vbsd_coalition_zone);
+	mtx_destroy(&vbsd_external_ops_lock);
 	return (error);
 }
 
@@ -2857,11 +2581,10 @@ vbsd_coalition_modevent(module_t mod __unused, int type, void *arg __unused)
 		vbsd_eventhandler_fini();
 		vbsd_jail_osd_fini();
 		vbsd_proc_hash_fini();
-		vbsd_deregister_builtins();
 
 		uma_zdestroy(vbsd_member_zone);
-		uma_zdestroy(vbsd_coalition_file_zone);
 		uma_zdestroy(vbsd_coalition_zone);
+		mtx_destroy(&vbsd_external_ops_lock);
 		return (0);
 	default:
 		return (EOPNOTSUPP);
