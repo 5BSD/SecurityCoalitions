@@ -828,19 +828,6 @@ struct vbsd_jail_osd {
 	struct vbsd_member	*vjo_member;	/* back-pointer for exit tracking */
 };
 
-static struct vbsd_coalition *
-vbsd_jail_coalition(struct prison *pr)
-{
-	struct vbsd_jail_osd *vjo;
-
-	if (vbsd_jail_osd_slot == 0)
-		return (NULL);
-	vjo = osd_jail_get(pr, vbsd_jail_osd_slot);
-	if (vjo == NULL)
-		return (NULL);
-	return (vjo->vjo_coalition);
-}
-
 /*
  * Atomically set jail coalition if not already set.
  * Returns 0 on success, EBUSY if already in a coalition, ENOMEM on failure.
@@ -1633,34 +1620,16 @@ vbsd_process_fork(void *arg __unused, struct proc *parent, struct proc *child,
 	struct vbsd_proc_data *vpd;
 	struct vbsd_coalition *vc;
 
+	/* Only inherit if parent is directly enlisted in a coalition */
 	rw_rlock(&vbsd_proc_hash_lock);
 	pvm = vbsd_proc_hash_lookup_locked(parent);
-	if (pvm != NULL) {
-		vc = pvm->vm_coalition;
-		vbsd_coalition_ref(vc);
+	if (pvm == NULL) {
 		rw_runlock(&vbsd_proc_hash_lock);
-	} else {
-		struct prison *pr;
-		struct ucred *cred;
-
-		rw_runlock(&vbsd_proc_hash_lock);
-
-		/* Check if child's jail is enlisted */
-		cred = child->p_ucred;
-		if (cred == NULL)
-			return;
-		pr = cred->cr_prison;
-		if (pr == NULL)
-			return;
-		prison_hold(pr);
-		vc = vbsd_jail_coalition(pr);
-		if (vc == NULL) {
-			prison_free(pr);
-			return;
-		}
-		vbsd_coalition_ref(vc);
-		prison_free(pr);
+		return;
 	}
+	vc = pvm->vm_coalition;
+	vbsd_coalition_ref(vc);
+	rw_runlock(&vbsd_proc_hash_lock);
 
 	/*
 	 * Check resource limits but don't fail - fork inheritance is
