@@ -20,6 +20,7 @@
 #include <sys/uio.h>
 #include <sys/jail.h>
 #include <sys/sysctl.h>
+#include <sys/event.h>
 
 #include <errno.h>
 #include <fcntl.h>
@@ -5325,6 +5326,316 @@ test_nested_coalition_depth_limit(void)
 }
 
 /* =========================================================================
+ * KQUEUE EVENT NOTIFICATION TESTS
+ *
+ * Coalition fds support EVFILT_READ for kqueue-based event notification.
+ * Events are delivered with VBSD_NOTE_* flags in kev.fflags.
+ * ========================================================================= */
+
+/*
+ * Helper: poll kqueue with timeout, return number of events
+ */
+static int
+kqueue_poll(int kq_fd, struct kevent *events, int nevents, int timeout_ms)
+{
+	struct timespec ts;
+
+	ts.tv_sec = timeout_ms / 1000;
+	ts.tv_nsec = (timeout_ms % 1000) * 1000000L;
+
+	return kevent(kq_fd, NULL, 0, events, nevents, &ts);
+}
+
+/*
+ * Test: Basic kqueue registration on coalition fd
+ */
+static struct test_result
+test_kqueue_register_basic(void)
+{
+	int coal_fd, kq_fd;
+	struct kevent kev;
+	int ret;
+
+	coal_fd = create_coalition();
+	TEST_ASSERT(coal_fd >= 0, "Failed to create coalition");
+
+	kq_fd = kqueue();
+	if (kq_fd < 0) {
+		close(coal_fd);
+		return TEST_FAIL("Failed to create kqueue");
+	}
+
+	/* Register coalition fd with EVFILT_READ */
+	EV_SET(&kev, coal_fd, EVFILT_READ, EV_ADD | EV_CLEAR, 0, 0, NULL);
+	ret = kevent(kq_fd, &kev, 1, NULL, 0, NULL);
+	TEST_ASSERT(ret == 0, "kevent registration failed");
+
+	close(kq_fd);
+	close(coal_fd);
+	return TEST_PASS(NULL);
+}
+
+/*
+ * Test: Receive MEMBER_ADDED event via EVFILT_READ
+ */
+static struct test_result
+test_kqueue_member_added_event(void)
+{
+	int coal_fd, kq_fd, proc_fd;
+	pid_t pid;
+	struct kevent kev;
+	int ret, nev;
+
+	coal_fd = create_coalition();
+	TEST_ASSERT(coal_fd >= 0, "Failed to create coalition");
+
+	kq_fd = kqueue();
+	if (kq_fd < 0) {
+		close(coal_fd);
+		return TEST_FAIL("Failed to create kqueue");
+	}
+
+	/* Register coalition fd with EVFILT_READ */
+	EV_SET(&kev, coal_fd, EVFILT_READ, EV_ADD | EV_CLEAR, 0, 0, NULL);
+	ret = kevent(kq_fd, &kev, 1, NULL, 0, NULL);
+	if (ret != 0) {
+		close(kq_fd);
+		close(coal_fd);
+		return TEST_FAIL("kevent registration failed");
+	}
+
+	/* Create and enlist a process */
+	pid = pdfork(&proc_fd, PD_DAEMON);
+	if (pid < 0) {
+		close(kq_fd);
+		close(coal_fd);
+		return TEST_FAIL("pdfork failed");
+	}
+
+	if (pid == 0) {
+		close(kq_fd);
+		close(coal_fd);
+		pause();
+		_exit(0);
+	}
+
+	ret = ioctl(coal_fd, VBSD_COALITION_ENLIST, &proc_fd);
+	if (ret != 0) {
+		pdkill(proc_fd, SIGKILL);
+		waitpid(pid, NULL, 0);
+		close(proc_fd);
+		close(kq_fd);
+		close(coal_fd);
+		return TEST_FAIL("ENLIST failed");
+	}
+
+	/* Wait for event */
+	nev = kqueue_poll(kq_fd, &kev, 1, 500);
+	if (nev < 1) {
+		pdkill(proc_fd, SIGKILL);
+		waitpid(pid, NULL, 0);
+		close(proc_fd);
+		close(kq_fd);
+		close(coal_fd);
+		return TEST_FAIL("Did not receive MEMBER_ADDED event");
+	}
+
+	/* Verify event */
+	TEST_ASSERT((uintptr_t)kev.ident == (uintptr_t)coal_fd, "Wrong ident");
+	TEST_ASSERT(kev.filter == EVFILT_READ, "Wrong filter");
+	TEST_ASSERT((kev.fflags & VBSD_NOTE_MEMBER_ADDED) != 0,
+	    "MEMBER_ADDED flag not set");
+
+	/* Cleanup */
+	pdkill(proc_fd, SIGKILL);
+	waitpid(pid, NULL, 0);
+	close(proc_fd);
+	close(kq_fd);
+	close(coal_fd);
+	return TEST_PASS(NULL);
+}
+
+/*
+ * Test: Receive TERMINATING event via EVFILT_READ
+ */
+static struct test_result
+test_kqueue_terminating_event(void)
+{
+	int coal_fd, kq_fd, proc_fd;
+	pid_t pid;
+	struct kevent kev;
+	int ret, nev;
+
+	coal_fd = create_coalition();
+	TEST_ASSERT(coal_fd >= 0, "Failed to create coalition");
+
+	kq_fd = kqueue();
+	if (kq_fd < 0) {
+		close(coal_fd);
+		return TEST_FAIL("Failed to create kqueue");
+	}
+
+	/* Register coalition fd with EVFILT_READ */
+	EV_SET(&kev, coal_fd, EVFILT_READ, EV_ADD | EV_CLEAR, 0, 0, NULL);
+	ret = kevent(kq_fd, &kev, 1, NULL, 0, NULL);
+	if (ret != 0) {
+		close(kq_fd);
+		close(coal_fd);
+		return TEST_FAIL("kevent registration failed");
+	}
+
+	/* Enlist a process */
+	pid = pdfork(&proc_fd, PD_DAEMON);
+	if (pid < 0) {
+		close(kq_fd);
+		close(coal_fd);
+		return TEST_FAIL("pdfork failed");
+	}
+
+	if (pid == 0) {
+		close(kq_fd);
+		close(coal_fd);
+		pause();
+		_exit(0);
+	}
+
+	ret = ioctl(coal_fd, VBSD_COALITION_ENLIST, &proc_fd);
+	if (ret != 0) {
+		pdkill(proc_fd, SIGKILL);
+		waitpid(pid, NULL, 0);
+		close(proc_fd);
+		close(kq_fd);
+		close(coal_fd);
+		return TEST_FAIL("ENLIST failed");
+	}
+
+	/* Drain MEMBER_ADDED event */
+	(void)kqueue_poll(kq_fd, &kev, 1, 100);
+
+	/* Terminate coalition */
+	ret = ioctl(coal_fd, VBSD_COALITION_TERMINATE, NULL);
+	if (ret != 0) {
+		pdkill(proc_fd, SIGKILL);
+		waitpid(pid, NULL, 0);
+		close(proc_fd);
+		close(kq_fd);
+		close(coal_fd);
+		return TEST_FAIL("TERMINATE failed");
+	}
+
+	/* Wait for TERMINATING event */
+	nev = kqueue_poll(kq_fd, &kev, 1, 500);
+	if (nev < 1) {
+		waitpid(pid, NULL, 0);
+		close(proc_fd);
+		close(kq_fd);
+		close(coal_fd);
+		return TEST_FAIL("Did not receive TERMINATING event");
+	}
+
+	/* Verify event */
+	TEST_ASSERT((uintptr_t)kev.ident == (uintptr_t)coal_fd, "Wrong ident");
+	TEST_ASSERT((kev.fflags & VBSD_NOTE_TERMINATING) != 0,
+	    "TERMINATING flag not set");
+
+	/* Cleanup */
+	waitpid(pid, NULL, 0);
+	close(proc_fd);
+	close(kq_fd);
+	close(coal_fd);
+	return TEST_PASS(NULL);
+}
+
+/*
+ * Test: Multiple events accumulated in fflags
+ */
+static struct test_result
+test_kqueue_multiple_events(void)
+{
+	int coal_fd, kq_fd, proc_fd;
+	pid_t pid;
+	struct kevent kev;
+	int ret, nev;
+
+	coal_fd = create_coalition();
+	TEST_ASSERT(coal_fd >= 0, "Failed to create coalition");
+
+	kq_fd = kqueue();
+	if (kq_fd < 0) {
+		close(coal_fd);
+		return TEST_FAIL("Failed to create kqueue");
+	}
+
+	/* Register coalition fd with EVFILT_READ */
+	EV_SET(&kev, coal_fd, EVFILT_READ, EV_ADD | EV_CLEAR, 0, 0, NULL);
+	ret = kevent(kq_fd, &kev, 1, NULL, 0, NULL);
+	if (ret != 0) {
+		close(kq_fd);
+		close(coal_fd);
+		return TEST_FAIL("kevent registration failed");
+	}
+
+	/* Enlist a process */
+	pid = pdfork(&proc_fd, PD_DAEMON);
+	if (pid < 0) {
+		close(kq_fd);
+		close(coal_fd);
+		return TEST_FAIL("pdfork failed");
+	}
+
+	if (pid == 0) {
+		close(kq_fd);
+		close(coal_fd);
+		pause();
+		_exit(0);
+	}
+
+	ret = ioctl(coal_fd, VBSD_COALITION_ENLIST, &proc_fd);
+	if (ret != 0) {
+		pdkill(proc_fd, SIGKILL);
+		waitpid(pid, NULL, 0);
+		close(proc_fd);
+		close(kq_fd);
+		close(coal_fd);
+		return TEST_FAIL("ENLIST failed");
+	}
+
+	/* Terminate immediately - both MEMBER_ADDED and TERMINATING happen */
+	ret = ioctl(coal_fd, VBSD_COALITION_TERMINATE, NULL);
+	if (ret != 0) {
+		pdkill(proc_fd, SIGKILL);
+		waitpid(pid, NULL, 0);
+		close(proc_fd);
+		close(kq_fd);
+		close(coal_fd);
+		return TEST_FAIL("TERMINATE failed");
+	}
+
+	/* Wait for accumulated events */
+	nev = kqueue_poll(kq_fd, &kev, 1, 500);
+	if (nev < 1) {
+		waitpid(pid, NULL, 0);
+		close(proc_fd);
+		close(kq_fd);
+		close(coal_fd);
+		return TEST_FAIL("Did not receive events");
+	}
+
+	/* Verify both events are present */
+	TEST_ASSERT((kev.fflags & VBSD_NOTE_MEMBER_ADDED) != 0,
+	    "MEMBER_ADDED flag not set");
+	TEST_ASSERT((kev.fflags & VBSD_NOTE_TERMINATING) != 0,
+	    "TERMINATING flag not set");
+
+	/* Cleanup */
+	waitpid(pid, NULL, 0);
+	close(proc_fd);
+	close(kq_fd);
+	close(coal_fd);
+	return TEST_PASS(NULL);
+}
+
+/* =========================================================================
  * MAIN
  * ========================================================================= */
 
@@ -5581,6 +5892,16 @@ main(int argc __unused, char *argv[] __unused)
 	    "Self-enlistment fails", test_nested_coalition_self_enlist);
 	test_harness_register("test_nested_coalition_depth_limit",
 	    "Nesting depth limit enforced", test_nested_coalition_depth_limit);
+
+	/* Kqueue event notification tests */
+	test_harness_register("test_kqueue_register_basic",
+	    "Register kqueue on coalition fd", test_kqueue_register_basic);
+	test_harness_register("test_kqueue_member_added_event",
+	    "Receive MEMBER_ADDED event", test_kqueue_member_added_event);
+	test_harness_register("test_kqueue_terminating_event",
+	    "Receive TERMINATING event", test_kqueue_terminating_event);
+	test_harness_register("test_kqueue_multiple_events",
+	    "Receive multiple event types", test_kqueue_multiple_events);
 
 	int result = test_harness_run_all();
 	test_harness_summary();

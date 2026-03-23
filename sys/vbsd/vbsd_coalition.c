@@ -49,6 +49,7 @@
 #include <vm/uma.h>
 #include <sys/resourcevar.h>
 #include <sys/user.h>
+#include <sys/event.h>
 
 #include "vbsd_coalition.h"
 
@@ -272,6 +273,7 @@ static eventhandler_tag vbsd_exit_tag;
 
 /* Forward declarations */
 static fo_ioctl_t	vbsd_coalition_fo_ioctl;
+static fo_kqfilter_t	vbsd_coalition_fo_kqfilter;
 static fo_close_t	vbsd_coalition_fo_close;
 static fo_stat_t	vbsd_coalition_fo_stat;
 static void		vbsd_coalition_terminate_members_locked(
@@ -619,13 +621,105 @@ vbsd_coalition_fo_stat(struct file *fp __unused, struct stat *sb,
 	return (0);
 }
 
+/* ========================================================================
+ * Kqueue Filter Operations
+ * ======================================================================== */
+
+/*
+ * Knlist lock functions for sx lock integration.
+ */
+static void
+vbsd_knlist_lock(void *arg)
+{
+	struct sx *sx = arg;
+
+	sx_xlock(sx);
+}
+
+static void
+vbsd_knlist_unlock(void *arg)
+{
+	struct sx *sx = arg;
+
+	sx_xunlock(sx);
+}
+
+static void
+vbsd_knlist_assert_lock(void *arg, int what)
+{
+
+#ifdef INVARIANTS
+	struct sx *sx = arg;
+
+	if (what == LA_LOCKED)
+		sx_assert(sx, SA_XLOCKED);
+	else
+		sx_assert(sx, SA_UNLOCKED);
+#else
+	(void)arg;
+	(void)what;
+#endif
+}
+
+static void
+filt_coalition_detach(struct knote *kn)
+{
+	struct vbsd_coalition *vc = kn->kn_hook;
+
+	knlist_remove(&vc->vc_knlist, kn, 0);
+}
+
+static int
+filt_coalition_event(struct knote *kn, long hint)
+{
+
+	/*
+	 * Store the event type in fflags for delivery.
+	 * hint contains VBSD_NOTE_* flags.
+	 */
+	if (hint != 0)
+		kn->kn_fflags |= hint;
+
+	return (kn->kn_fflags != 0);
+}
+
+static struct filterops coalition_filtops = {
+	.f_isfd = 1,
+	.f_detach = filt_coalition_detach,
+	.f_event = filt_coalition_event,
+};
+
+static int
+vbsd_coalition_fo_kqfilter(struct file *fp, struct knote *kn)
+{
+	struct vbsd_coalition_file *vcf;
+	struct vbsd_coalition *vc;
+
+	vcf = fp->f_data;
+	if (vcf == NULL)
+		return (EBADF);
+	vc = vcf->vcf_coalition;
+	if (vc == NULL)
+		return (EBADF);
+
+	switch (kn->kn_filter) {
+	case EVFILT_READ:
+		kn->kn_fop = &coalition_filtops;
+		kn->kn_hook = vc;
+		knlist_add(&vc->vc_knlist, kn, 0);
+		return (0);
+	default:
+		return (EINVAL);
+	}
+}
+
 static struct fileops vbsd_coalition_fileops = {
 	.fo_read = invfo_rdwr,
 	.fo_write = invfo_rdwr,
 	.fo_truncate = invfo_truncate,
 	.fo_ioctl = vbsd_coalition_fo_ioctl,
 	.fo_poll = invfo_poll,
-	.fo_kqfilter = invfo_kqfilter,
+	.fo_kqfilter = vbsd_coalition_fo_kqfilter,
 	.fo_stat = vbsd_coalition_fo_stat,
 	.fo_close = vbsd_coalition_fo_close,
 	.fo_chmod = invfo_chmod,
@@ -642,6 +736,8 @@ vbsd_coalition_alloc(void)
 	vc = uma_zalloc(vbsd_coalition_zone, M_WAITOK | M_ZERO);
 	sx_init(&vc->vc_sx, "vbsd_coalition");
 	TAILQ_INIT(&vc->vc_members);
+	knlist_init(&vc->vc_knlist, &vc->vc_sx, vbsd_knlist_lock,
+	    vbsd_knlist_unlock, vbsd_knlist_assert_lock);
 	vc->vc_signal = SIGKILL;	/* Default to immediate termination */
 	vc->vc_nesting_depth = 0;
 	vc->vc_flags = 0;
@@ -715,6 +811,7 @@ vbsd_deadline_task_fn(void *context, int pending __unused)
 	 */
 	if (vc->vc_flags & VCF_DEADLINE_GRACE) {
 		/* Grace period expired - do full termination with SIGKILL */
+		KNOTE_LOCKED(&vc->vc_knlist, VBSD_NOTE_DEADLINE_FIRED);
 		vc->vc_flags &= ~(VCF_DEADLINE_ACTIVE | VCF_DEADLINE_GRACE);
 		vbsd_coalition_terminate_members_locked(vc, td, false);
 	} else if (vc->vc_deadline_signal != 0 &&
@@ -744,6 +841,10 @@ vbsd_deadline_task_fn(void *context, int pending __unused)
 			}
 		}
 
+		/* Notify that deadline fired and grace period is starting */
+		KNOTE_LOCKED(&vc->vc_knlist, VBSD_NOTE_DEADLINE_FIRED);
+		KNOTE_LOCKED(&vc->vc_knlist, VBSD_NOTE_GRACE_STARTED);
+
 		/* Schedule grace period timeout */
 		vc->vc_flags |= VCF_DEADLINE_GRACE;
 		vbsd_coalition_ref(vc);  /* Reference for next callout */
@@ -752,6 +853,7 @@ vbsd_deadline_task_fn(void *context, int pending __unused)
 		    vbsd_deadline_callout, vc);
 	} else {
 		/* No grace period - immediate termination */
+		KNOTE_LOCKED(&vc->vc_knlist, VBSD_NOTE_DEADLINE_FIRED);
 		vc->vc_flags &= ~VCF_DEADLINE_ACTIVE;
 		vbsd_coalition_terminate_members_locked(vc, td, false);
 	}
@@ -804,6 +906,7 @@ vbsd_watchdog_task_fn(void *context, int pending __unused)
 	}
 
 	/* Watchdog expired - terminate everything */
+	KNOTE_LOCKED(&vc->vc_knlist, VBSD_NOTE_WATCHDOG_FIRED);
 	vc->vc_flags &= ~VCF_WATCHDOG_ACTIVE;
 	vbsd_coalition_terminate_members_locked(vc, td, false);
 
@@ -1332,6 +1435,9 @@ vbsd_coalition_enlist_generic(struct vbsd_coalition *vc, struct thread *td,
 
 	atomic_add_int(&vc->vc_member_count, 1);
 
+	/* Notify kqueue watchers of new member */
+	KNOTE_LOCKED(&vc->vc_knlist, VBSD_NOTE_MEMBER_ADDED);
+
 	vbsd_coalition_ref(vc);
 	sx_xunlock(&vc->vc_sx);
 
@@ -1392,6 +1498,9 @@ vbsd_coalition_join(struct vbsd_coalition *vc, struct thread *td)
 	atomic_add_int(&vc->vc_member_count, 1);
 	vbsd_member_count_inc_builtin(DTYPE_PROCDESC);
 
+	/* Notify kqueue watchers of new member */
+	KNOTE_LOCKED(&vc->vc_knlist, VBSD_NOTE_MEMBER_ADDED);
+
 	vbsd_coalition_ref(vc);
 
 	sx_xunlock(&vc->vc_sx);
@@ -1422,6 +1531,9 @@ vbsd_coalition_terminate_members_locked(struct vbsd_coalition *vc,
 		return;
 
 	vc->vc_flags |= VCF_TERMINATING;
+
+	/* Notify kqueue watchers that termination has started */
+	KNOTE_LOCKED(&vc->vc_knlist, VBSD_NOTE_TERMINATING);
 
 	/* Close path may need to avoid killing the closing process itself. */
 	self = (skip_self && td != NULL) ? td->td_proc : NULL;
@@ -2749,7 +2861,13 @@ vbsd_coalition_fo_close(struct file *fp, struct thread *td)
 	*cleanup_tailp = NULL;
 	*jail_tailp = NULL;
 
+	/* Notify kqueue watchers that the coalition is terminated */
+	KNOTE_LOCKED(&vc->vc_knlist, VBSD_NOTE_TERMINATED);
+
 	sx_xunlock(&vc->vc_sx);
+
+	/* Clean up knlist (detaches all knotes) */
+	knlist_destroy(&vc->vc_knlist);
 
 	/*
 	 * Now clean up collected members without holding vc_sx.

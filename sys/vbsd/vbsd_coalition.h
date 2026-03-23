@@ -411,6 +411,45 @@ struct vbsd_coalition_rusage {
 	uint64_t	vcr_spare[4];
 };
 
+/*
+ * ============================================================================
+ * KQUEUE INTEGRATION
+ * ============================================================================
+ *
+ * Coalition fds are kqueue-filterable using EVFILT_READ. Events are
+ * delivered via the standard kevent mechanism.
+ *
+ * Example:
+ *   int kq = kqueue();
+ *   struct kevent kev;
+ *
+ *   // Register coalition fd with kqueue (NOTE_* selects events)
+ *   EV_SET(&kev, coal_fd, EVFILT_READ, EV_ADD | EV_CLEAR,
+ *          NOTE_WRITE,  // NOTE_WRITE = any coalition event
+ *          0, NULL);
+ *   kevent(kq, &kev, 1, NULL, 0, NULL);
+ *
+ *   // Wait for events
+ *   kevent(kq, NULL, 0, &kev, 1, NULL);
+ *   if (kev.fflags & VBSD_NOTE_TERMINATING)
+ *       printf("Coalition terminating!\n");
+ *
+ * The fflags field contains VBSD_NOTE_* flags indicating what happened.
+ * The data field contains event-specific info (e.g., dtype for member add).
+ */
+
+/* Event types for kqueue notifications (delivered in kevent fflags) */
+#define VBSD_NOTE_MEMBER_ADDED		0x0001	/* New member enlisted */
+#define VBSD_NOTE_MEMBER_REMOVED	0x0002	/* Member exited/removed */
+#define VBSD_NOTE_TERMINATING		0x0004	/* Termination started */
+#define VBSD_NOTE_TERMINATED		0x0008	/* All members terminated */
+#define VBSD_NOTE_LEADER_DIED		0x0010	/* Leader death triggered term */
+#define VBSD_NOTE_DEADLINE_FIRED	0x0020	/* Deadline timer expired */
+#define VBSD_NOTE_WATCHDOG_FIRED	0x0040	/* Watchdog timeout */
+#define VBSD_NOTE_GRACE_STARTED		0x0080	/* Grace period began */
+
+#define VBSD_NOTE_ALL			0x00FF	/* All events */
+
 /* Maximum nesting depth to prevent infinite loops */
 #define VBSD_MAX_NESTING_DEPTH	16
 
@@ -423,6 +462,7 @@ struct vbsd_coalition_rusage {
 #include <sys/file.h>
 #include <sys/callout.h>
 #include <sys/taskqueue.h>
+#include <sys/event.h>
 
 /* ========================================================================
  * Public API for External Modules
@@ -548,6 +588,9 @@ struct vbsd_coalition {
 	 * Used by nested coalitions to notify parent on termination.
 	 */
 	struct vbsd_member		*vc_leader_of;	/* Member in parent (NULL = none) */
+
+	/* Kqueue notification */
+	struct knlist			vc_knlist;	/* For kqueue event delivery */
 };
 
 /*
