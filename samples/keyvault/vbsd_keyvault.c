@@ -10,6 +10,8 @@
  *   2. Optional coalition integration (works with or without coalition)
  *   3. Interior revocation on coalition termination
  *   4. Proper cleanup and error handling
+ *   5. MOF_CAN_LEAD - keyvault can be a coalition leader
+ *      When revoked, triggers coalition termination via VBSD_LEADER_DIED
  */
 
 #include <sys/param.h>
@@ -103,6 +105,7 @@ keyvault_coalition_terminate(struct file *fp, struct thread *td __unused)
 static struct vbsd_member_ops keyvault_coalition_ops = {
 	.mo_terminate = keyvault_coalition_terminate,
 	.mo_name = "keyvault",
+	.mo_flags = MOF_CAN_LEAD,	/* Keyvault can be coalition leader */
 };
 
 /* ========================================================================
@@ -226,11 +229,13 @@ keyvault_delete(struct keyvault *kv, uint32_t slot)
 static int
 keyvault_revoke(struct keyvault *kv)
 {
+	struct file *fp;
 	int i;
 
 	KEYVAULT_LOCK(kv);
 
 	kv->kv_revoked = true;
+	fp = kv->kv_fp;
 
 	for (i = 0; i < KEYVAULT_MAX_SLOTS; i++) {
 		if (kv->kv_slots[i].ks_valid) {
@@ -244,6 +249,15 @@ keyvault_revoke(struct keyvault *kv)
 	wakeup(kv);
 
 	KEYVAULT_UNLOCK(kv);
+
+	/*
+	 * If this keyvault is a coalition leader, notify the coalition.
+	 * The coalition will terminate all members when keys are revoked.
+	 * This is a security feature: if key material is compromised,
+	 * all dependent processes are terminated.
+	 */
+	if (fp != NULL && vbsd_coalition_available())
+		VBSD_LEADER_DIED(fp);
 
 	return (0);
 }
@@ -312,6 +326,7 @@ keyvault_fdopen(struct cdev *dev __unused, int oflags __unused,
 	struct keyvault *kv;
 
 	kv = keyvault_alloc();
+	kv->kv_fp = fp;		/* Store for VBSD_LEADER_DIED */
 	finit(fp, FREAD | FWRITE, keyvault_dtype, kv, &keyvault_fileops);
 
 	return (0);

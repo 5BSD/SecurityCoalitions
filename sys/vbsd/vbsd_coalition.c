@@ -195,6 +195,33 @@ static u_int vbsd_jail_osd_slot;
 static eventhandler_tag vbsd_fork_tag;
 static eventhandler_tag vbsd_exit_tag;
 
+/*
+ * Leader hash for third-party leader death notification.
+ * Maps file pointer -> member for quick lookup when vbsd_leader_died fires.
+ * Only contains third-party leaders (processes/jails use their own mechanisms).
+ */
+#define VBSD_LEADER_HASH_SIZE	64
+static LIST_HEAD(vbsd_leader_hashhead, vbsd_leader_entry) vbsd_leader_hash[VBSD_LEADER_HASH_SIZE];
+static struct mtx vbsd_leader_hash_lock;
+static eventhandler_tag vbsd_leader_died_tag;
+
+struct vbsd_leader_entry {
+	LIST_ENTRY(vbsd_leader_entry)	vle_link;
+	struct file			*vle_fp;
+	struct vbsd_member		*vle_member;
+};
+
+static inline u_int
+vbsd_leader_hash_index(struct file *fp)
+{
+	uintptr_t key = (uintptr_t)fp;
+	return (hash32_buf(&key, sizeof(key), 0) & (VBSD_LEADER_HASH_SIZE - 1));
+}
+
+static void vbsd_leader_hash_insert(struct file *fp, struct vbsd_member *vm);
+static struct vbsd_member *vbsd_leader_hash_lookup(struct file *fp);
+static void vbsd_leader_hash_remove(struct file *fp);
+static void vbsd_leader_died_handler(void *arg, struct file *fp);
 
 /* Forward declarations */
 static fo_ioctl_t	vbsd_coalition_fo_ioctl;
@@ -1200,6 +1227,26 @@ vbsd_coalition_terminate_members_locked(struct vbsd_coalition *vc,
 		return;
 
 	vc->vc_flags |= VCF_TERMINATING;
+
+	/*
+	 * Clean up leader tracking before termination.
+	 * Remove third-party leaders from hash so they don't
+	 * trigger duplicate termination via VBSD_LEADER_DIED.
+	 */
+	if (vc->vc_leader != NULL) {
+		struct vbsd_member *leader_vm = vc->vc_leader;
+
+		if (leader_vm->vm_ops != NULL &&
+		    leader_vm->vm_ops != &vbsd_proc_ops &&
+		    leader_vm->vm_ops != &vbsd_jail_ops &&
+		    leader_vm->vm_ops != &vbsd_coalition_ops &&
+		    leader_vm->vm_fp != NULL) {
+			vbsd_leader_hash_remove(leader_vm->vm_fp);
+		}
+		vc->vc_leader = NULL;
+		vc->vc_flags &= ~VCF_HAS_LEADER;
+	}
+
 	KNOTE_LOCKED(&vc->vc_knlist, VBSD_NOTE_TERMINATING);
 
 	self = (skip_self && td != NULL) ? td->td_proc : NULL;
@@ -1897,19 +1944,28 @@ vbsd_coalition_fo_ioctl(struct file *fp, u_long cmd, void *data,
 			/* Clear leader if fd is -1 */
 			if (target_fd == -1) {
 				/*
-				 * If old leader was a coalition, clear its
-				 * back-pointer.
+				 * Clean up old leader's tracking structures.
 				 */
-				if (vc->vc_leader != NULL &&
-				    vc->vc_leader->vm_ops == &vbsd_coalition_ops &&
-				    vc->vc_leader->vm_fp != NULL) {
-					struct vbsd_coalition *old_child;
+				if (vc->vc_leader != NULL) {
+					struct vbsd_member *old_vm = vc->vc_leader;
 
-					old_child = vc->vc_leader->vm_fp->f_data;
-					if (old_child != NULL) {
-						sx_xlock(&old_child->vc_sx);
-						old_child->vc_leader_of = NULL;
-						sx_xunlock(&old_child->vc_sx);
+					if (old_vm->vm_ops == &vbsd_coalition_ops &&
+					    old_vm->vm_fp != NULL) {
+						/* Coalition: clear back-pointer */
+						struct vbsd_coalition *old_child;
+
+						old_child = old_vm->vm_fp->f_data;
+						if (old_child != NULL) {
+							sx_xlock(&old_child->vc_sx);
+							old_child->vc_leader_of = NULL;
+							sx_xunlock(&old_child->vc_sx);
+						}
+					} else if (old_vm->vm_ops != NULL &&
+					    old_vm->vm_ops != &vbsd_proc_ops &&
+					    old_vm->vm_ops != &vbsd_jail_ops &&
+					    old_vm->vm_fp != NULL) {
+						/* Third-party: remove from hash */
+						vbsd_leader_hash_remove(old_vm->vm_fp);
 					}
 				}
 
@@ -1946,10 +2002,35 @@ vbsd_coalition_fo_ioctl(struct file *fp, u_long cmd, void *data,
 			}
 
 			/*
+			 * Clean up old leader's tracking before setting new one.
+			 */
+			if (vc->vc_leader != NULL) {
+				struct vbsd_member *old_vm = vc->vc_leader;
+
+				if (old_vm->vm_ops == &vbsd_coalition_ops &&
+				    old_vm->vm_fp != NULL) {
+					struct vbsd_coalition *old_child;
+
+					old_child = old_vm->vm_fp->f_data;
+					if (old_child != NULL) {
+						sx_xlock(&old_child->vc_sx);
+						old_child->vc_leader_of = NULL;
+						sx_xunlock(&old_child->vc_sx);
+					}
+				} else if (old_vm->vm_ops != NULL &&
+				    old_vm->vm_ops != &vbsd_proc_ops &&
+				    old_vm->vm_ops != &vbsd_jail_ops &&
+				    old_vm->vm_fp != NULL) {
+					vbsd_leader_hash_remove(old_vm->vm_fp);
+				}
+			}
+
+			/*
 			 * Validate the member type and extract tracking info.
 			 * - Processes: track pid for exit handler
 			 * - Jails: track member pointer (OSD destructor handles it)
 			 * - Coalitions: track member pointer (terminate callback)
+			 * - Third-party with MOF_CAN_LEAD: add to leader hash
 			 */
 			if (vm->vm_ops == &vbsd_proc_ops) {
 				struct procdesc *pd;
@@ -2000,10 +2081,21 @@ vbsd_coalition_fo_ioctl(struct file *fp, u_long cmd, void *data,
 				vc->vc_leader = vm;
 				vc->vc_leader_pid = 0;
 				vc->vc_flags |= VCF_HAS_LEADER;
+			} else if (vm->vm_ops != NULL &&
+			    (vm->vm_ops->mo_flags & MOF_CAN_LEAD)) {
+				/*
+				 * Third-party type with MOF_CAN_LEAD.
+				 * Module fires VBSD_LEADER_DIED when resource dies.
+				 */
+				vbsd_leader_hash_insert(target_fp, vm);
+
+				vc->vc_leader = vm;
+				vc->vc_leader_pid = 0;
+				vc->vc_flags |= VCF_HAS_LEADER;
 			} else {
 				/*
-				 * Other types (sockets, shm, etc.) don't have
-				 * a meaningful "death" concept.
+				 * Type doesn't support being a leader.
+				 * Either no ops, or MOF_CAN_LEAD not set.
 				 */
 				fdrop(target_fp, td);
 				sx_xunlock(&vc->vc_sx);
@@ -2469,6 +2561,117 @@ vbsd_proc_hash_fini(void)
 	rw_destroy(&vbsd_proc_hash_lock);
 }
 
+/* Leader Hash Table for third-party leader death notification */
+
+static int
+vbsd_leader_hash_init(void)
+{
+	int i;
+
+	mtx_init(&vbsd_leader_hash_lock, "vbsd_leader_hash", NULL, MTX_DEF);
+	for (i = 0; i < VBSD_LEADER_HASH_SIZE; i++)
+		LIST_INIT(&vbsd_leader_hash[i]);
+	return (0);
+}
+
+static void
+vbsd_leader_hash_fini(void)
+{
+	mtx_destroy(&vbsd_leader_hash_lock);
+}
+
+static void
+vbsd_leader_hash_insert(struct file *fp, struct vbsd_member *vm)
+{
+	struct vbsd_leader_entry *vle;
+	u_int idx;
+
+	vle = malloc(sizeof(*vle), M_VBSD_COALITION, M_WAITOK);
+	vle->vle_fp = fp;
+	vle->vle_member = vm;
+
+	mtx_lock(&vbsd_leader_hash_lock);
+	idx = vbsd_leader_hash_index(fp);
+	LIST_INSERT_HEAD(&vbsd_leader_hash[idx], vle, vle_link);
+	mtx_unlock(&vbsd_leader_hash_lock);
+}
+
+static struct vbsd_member *
+vbsd_leader_hash_lookup(struct file *fp)
+{
+	struct vbsd_leader_entry *vle;
+	struct vbsd_member *vm = NULL;
+	u_int idx;
+
+	mtx_lock(&vbsd_leader_hash_lock);
+	idx = vbsd_leader_hash_index(fp);
+	LIST_FOREACH(vle, &vbsd_leader_hash[idx], vle_link) {
+		if (vle->vle_fp == fp) {
+			vm = vle->vle_member;
+			break;
+		}
+	}
+	mtx_unlock(&vbsd_leader_hash_lock);
+	return (vm);
+}
+
+static void
+vbsd_leader_hash_remove(struct file *fp)
+{
+	struct vbsd_leader_entry *vle;
+	u_int idx;
+
+	mtx_lock(&vbsd_leader_hash_lock);
+	idx = vbsd_leader_hash_index(fp);
+	LIST_FOREACH(vle, &vbsd_leader_hash[idx], vle_link) {
+		if (vle->vle_fp == fp) {
+			LIST_REMOVE(vle, vle_link);
+			mtx_unlock(&vbsd_leader_hash_lock);
+			free(vle, M_VBSD_COALITION);
+			return;
+		}
+	}
+	mtx_unlock(&vbsd_leader_hash_lock);
+}
+
+/*
+ * Third-party leader death event handler.
+ * Called when a third-party module fires VBSD_LEADER_DIED(fp).
+ */
+static void
+vbsd_leader_died_handler(void *arg __unused, struct file *fp)
+{
+	struct vbsd_member *vm;
+	struct vbsd_coalition *vc;
+
+	vm = vbsd_leader_hash_lookup(fp);
+	if (vm == NULL)
+		return;
+
+	vc = vm->vm_coalition;
+	if (vc == NULL)
+		return;
+
+	sx_xlock(&vc->vc_sx);
+
+	/* Verify this is still the leader and not already terminating */
+	if (vc->vc_leader != vm || (vc->vc_flags & VCF_TERMINATING)) {
+		sx_xunlock(&vc->vc_sx);
+		return;
+	}
+
+	/* Remove from hash before triggering termination */
+	vbsd_leader_hash_remove(fp);
+
+	/* Notify kqueue listeners */
+	KNOTE_LOCKED(&vc->vc_knlist, VBSD_NOTE_LEADER_DIED);
+
+	/* Trigger coalition termination */
+	vbsd_coalition_terminate_members_locked(vc, curthread, false);
+
+	sx_xunlock(&vc->vc_sx);
+}
+
 static int
 vbsd_jail_osd_init(void)
 {
@@ -2499,12 +2702,22 @@ vbsd_eventhandler_init(void)
 		EVENTHANDLER_DEREGISTER(process_fork, vbsd_fork_tag);
 		return (ENOMEM);
 	}
+
+	vbsd_leader_died_tag = EVENTHANDLER_REGISTER(vbsd_leader_died,
+	    vbsd_leader_died_handler, NULL, EVENTHANDLER_PRI_ANY);
+	if (vbsd_leader_died_tag == NULL) {
+		EVENTHANDLER_DEREGISTER(process_exit, vbsd_exit_tag);
+		EVENTHANDLER_DEREGISTER(process_fork, vbsd_fork_tag);
+		return (ENOMEM);
+	}
+
 	return (0);
 }
 
 static void
 vbsd_eventhandler_fini(void)
 {
+	EVENTHANDLER_DEREGISTER(vbsd_leader_died, vbsd_leader_died_tag);
 	EVENTHANDLER_DEREGISTER(process_fork, vbsd_fork_tag);
 	EVENTHANDLER_DEREGISTER(process_exit, vbsd_exit_tag);
 }
@@ -2526,6 +2739,10 @@ vbsd_coalition_mod_init(void)
 	error = vbsd_proc_hash_init();
 	if (error != 0)
 		goto fail_hash;
+
+	error = vbsd_leader_hash_init();
+	if (error != 0)
+		goto fail_leader_hash;
 
 	error = vbsd_jail_osd_init();
 	if (error != 0)
@@ -2550,6 +2767,8 @@ fail_dev:
 fail_event:
 	vbsd_jail_osd_fini();
 fail_osd:
+	vbsd_leader_hash_fini();
+fail_leader_hash:
 	vbsd_proc_hash_fini();
 fail_hash:
 	uma_zdestroy(vbsd_member_zone);
@@ -2580,6 +2799,7 @@ vbsd_coalition_modevent(module_t mod __unused, int type, void *arg __unused)
 		destroy_dev(vbsd_coalition_dev);
 		vbsd_eventhandler_fini();
 		vbsd_jail_osd_fini();
+		vbsd_leader_hash_fini();
 		vbsd_proc_hash_fini();
 
 		uma_zdestroy(vbsd_member_zone);

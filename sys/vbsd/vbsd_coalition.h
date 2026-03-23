@@ -101,13 +101,24 @@ struct vbsd_coalition_rusage {
 #include <sys/callout.h>
 #include <sys/taskqueue.h>
 #include <sys/event.h>
+#include <sys/eventhandler.h>
 
 /* Public API */
 
+/*
+ * Third-party member operations.
+ *
+ * Modules register ops to integrate custom descriptor types with coalitions.
+ * Set mo_flags to indicate capabilities (e.g., MOF_CAN_LEAD).
+ */
 struct vbsd_member_ops {
-	int	(*mo_terminate)(struct file *fp, struct thread *td);
-	const char *mo_name;
+	int		(*mo_terminate)(struct file *fp, struct thread *td);
+	const char	*mo_name;
+	uint32_t	mo_flags;
 };
+
+/* mo_flags */
+#define MOF_CAN_LEAD	0x0001	/* This type can be a coalition leader */
 
 /*
  * Register ops for a new descriptor type. Coalition assigns the dtype.
@@ -116,6 +127,23 @@ struct vbsd_member_ops {
  */
 int	vbsd_member_ops_register(struct vbsd_member_ops *ops, int *dtype_out);
 int	vbsd_member_ops_deregister(int dtype);
+
+/*
+ * Leader death notification event.
+ *
+ * Third-party modules fire this event when a resource that may be a
+ * coalition leader dies. Coalition handles lookup and termination.
+ *
+ * Usage:
+ *     EVENTHANDLER_INVOKE(vbsd_leader_died, fp);
+ *
+ * Or use the convenience macro:
+ *     VBSD_LEADER_DIED(fp);
+ */
+typedef void (*vbsd_leader_died_fn)(void *arg, struct file *fp);
+EVENTHANDLER_DECLARE(vbsd_leader_died, vbsd_leader_died_fn);
+
+#define VBSD_LEADER_DIED(fp)	EVENTHANDLER_INVOKE(vbsd_leader_died, fp)
 #ifdef _SYS_MODULE_H_
 static __inline bool
 vbsd_coalition_available(void)

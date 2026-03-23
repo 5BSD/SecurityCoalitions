@@ -68,6 +68,7 @@ struct keyvault_slot {
 struct keyvault {
 	struct mtx		kv_lock;
 	bool			kv_revoked;	/* Set by coalition terminate */
+	struct file		*kv_fp;		/* Back-pointer for VBSD_LEADER_DIED */
 	struct keyvault_slot	kv_slots[KEYVAULT_MAX_SLOTS];
 };
 

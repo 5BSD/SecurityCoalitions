@@ -34,6 +34,14 @@
 #include "test_harness.h"
 #include "vbsd_coalition.h"
 
+/* Optional: keyvault sample module for third-party leader tests */
+#ifdef __has_include
+#if __has_include("../../samples/keyvault/vbsd_keyvault.h")
+#include "../../samples/keyvault/vbsd_keyvault.h"
+#define HAVE_KEYVAULT 1
+#endif
+#endif
+
 static void
 clear_clofork(int fd)
 {
@@ -5063,6 +5071,593 @@ test_leader_coalition_clear(void)
 	return TEST_PASS(NULL);
 }
 
+/*
+ * Test: Third-party leader (keyvault) - when revoked, triggers termination
+ *
+ * This tests the MOF_CAN_LEAD / VBSD_LEADER_DIED API:
+ * 1. Create coalition with keyvault as leader
+ * 2. Add worker process
+ * 3. Revoke keyvault (fires VBSD_LEADER_DIED)
+ * 4. Verify worker process was terminated
+ *
+ * Requires: keyvault module loaded (/dev/keyvault)
+ */
+#ifdef HAVE_KEYVAULT
+static struct test_result
+test_leader_thirdparty_keyvault(void)
+{
+	int coalition_fd, keyvault_fd, worker_fd;
+	pid_t worker_pid;
+	int ret, status;
+	int pipe_fds[2];
+	char ready;
+
+	/* Check if keyvault module is loaded */
+	keyvault_fd = open("/dev/keyvault", O_RDWR);
+	if (keyvault_fd < 0) {
+		if (errno == ENOENT)
+			return TEST_PASS("SKIPPED: /dev/keyvault not found");
+		return TEST_FAIL("open keyvault failed");
+	}
+
+	coalition_fd = create_coalition();
+	if (coalition_fd < 0) {
+		close(keyvault_fd);
+		return TEST_FAIL("Failed to create coalition");
+	}
+
+	/* Enlist keyvault in coalition */
+	ret = ioctl(coalition_fd, VBSD_COALITION_ENLIST, &keyvault_fd);
+	if (ret != 0) {
+		close(keyvault_fd);
+		close(coalition_fd);
+		return TEST_FAIL("Enlist keyvault failed");
+	}
+
+	/* Set keyvault as leader */
+	ret = ioctl(coalition_fd, VBSD_COALITION_SET_LEADER, &keyvault_fd);
+	if (ret != 0) {
+		close(keyvault_fd);
+		close(coalition_fd);
+		return TEST_FAIL("Set keyvault as leader failed");
+	}
+
+	/* Create sync pipe */
+	if (pipe(pipe_fds) < 0) {
+		close(keyvault_fd);
+		close(coalition_fd);
+		return TEST_FAIL("pipe failed");
+	}
+
+	/* Create worker process */
+	worker_pid = pdfork(&worker_fd, PD_DAEMON);
+	if (worker_pid < 0) {
+		close(pipe_fds[0]);
+		close(pipe_fds[1]);
+		close(keyvault_fd);
+		close(coalition_fd);
+		return TEST_FAIL("pdfork worker failed");
+	}
+	if (worker_pid == 0) {
+		close(pipe_fds[0]);
+		close(keyvault_fd);
+		close(coalition_fd);
+		write(pipe_fds[1], "R", 1);
+		close(pipe_fds[1]);
+		while (1)
+			sleep(10);
+		_exit(0);
+	}
+
+	close(pipe_fds[1]);
+
+	/* Wait for child ready */
+	ret = read_ready_byte(pipe_fds[0], &ready, 1000);
+	close(pipe_fds[0]);
+	if (ret != 1) {
+		pdkill(worker_fd, SIGKILL);
+		waitpid(worker_pid, NULL, 0);
+		close(worker_fd);
+		close(keyvault_fd);
+		close(coalition_fd);
+		return TEST_FAIL("Worker sync failed");
+	}
+
+	/* Enlist worker */
+	ret = ioctl(coalition_fd, VBSD_COALITION_ENLIST, &worker_fd);
+	if (ret != 0) {
+		pdkill(worker_fd, SIGKILL);
+		waitpid(worker_pid, NULL, 0);
+		close(worker_fd);
+		close(keyvault_fd);
+		close(coalition_fd);
+		return TEST_FAIL("Enlist worker failed");
+	}
+
+	/*
+	 * Revoke the keyvault - this fires VBSD_LEADER_DIED(fp)
+	 * which should trigger coalition termination.
+	 */
+	ret = ioctl(keyvault_fd, KEYVAULT_IOC_REVOKE);
+	if (ret != 0) {
+		pdkill(worker_fd, SIGKILL);
+		waitpid(worker_pid, NULL, 0);
+		close(worker_fd);
+		close(keyvault_fd);
+		close(coalition_fd);
+		return TEST_FAIL("Revoke keyvault failed");
+	}
+
+	/* Worker should be terminated by coalition */
+	ret = waitpid_timeout(worker_pid, &status, 2000);
+	if (ret != 0) {
+		pdkill(worker_fd, SIGKILL);
+		waitpid(worker_pid, NULL, 0);
+		close(worker_fd);
+		close(keyvault_fd);
+		close(coalition_fd);
+		return TEST_FAIL("Worker should have been killed");
+	}
+
+	close(worker_fd);
+	close(keyvault_fd);
+	close(coalition_fd);
+	return TEST_PASS(NULL);
+}
+
+/*
+ * Test: mo_terminate callback - coalition termination zeros keyvault keys
+ */
+static struct test_result
+test_thirdparty_terminate_callback(void)
+{
+	int coalition_fd, keyvault_fd;
+	int ret;
+	struct keyvault_key key;
+
+	/* Check if keyvault module is loaded */
+	keyvault_fd = open("/dev/keyvault", O_RDWR);
+	if (keyvault_fd < 0) {
+		if (errno == ENOENT)
+			return TEST_PASS("SKIPPED: /dev/keyvault not found");
+		return TEST_FAIL("open keyvault failed");
+	}
+
+	coalition_fd = create_coalition();
+	if (coalition_fd < 0) {
+		close(keyvault_fd);
+		return TEST_FAIL("Failed to create coalition");
+	}
+
+	/* Enlist keyvault */
+	ret = ioctl(coalition_fd, VBSD_COALITION_ENLIST, &keyvault_fd);
+	if (ret != 0) {
+		close(keyvault_fd);
+		close(coalition_fd);
+		return TEST_FAIL("Enlist keyvault failed");
+	}
+
+	/* Store a key */
+	memset(&key, 0, sizeof(key));
+	key.kk_slot = 0;
+	key.kk_len = 16;
+	memcpy(key.kk_data, "testkeydata12345", 16);
+
+	ret = ioctl(keyvault_fd, KEYVAULT_IOC_STORE, &key);
+	if (ret != 0) {
+		close(keyvault_fd);
+		close(coalition_fd);
+		return TEST_FAIL("Store key failed");
+	}
+
+	/* Verify key can be loaded */
+	memset(&key, 0, sizeof(key));
+	key.kk_slot = 0;
+	ret = ioctl(keyvault_fd, KEYVAULT_IOC_LOAD, &key);
+	if (ret != 0) {
+		close(keyvault_fd);
+		close(coalition_fd);
+		return TEST_FAIL("Load key failed before terminate");
+	}
+
+	/* Terminate coalition - should invoke mo_terminate on keyvault */
+	ret = ioctl(coalition_fd, VBSD_COALITION_TERMINATE);
+	if (ret != 0) {
+		close(keyvault_fd);
+		close(coalition_fd);
+		return TEST_FAIL("Terminate failed");
+	}
+
+	/* Keyvault should now be revoked - load should fail with EBADF */
+	memset(&key, 0, sizeof(key));
+	key.kk_slot = 0;
+	ret = ioctl(keyvault_fd, KEYVAULT_IOC_LOAD, &key);
+	if (ret == 0) {
+		close(keyvault_fd);
+		close(coalition_fd);
+		return TEST_FAIL("Load should fail after terminate");
+	}
+	if (errno != EBADF) {
+		close(keyvault_fd);
+		close(coalition_fd);
+		return TEST_FAIL("Expected EBADF after terminate");
+	}
+
+	close(keyvault_fd);
+	close(coalition_fd);
+	return TEST_PASS(NULL);
+}
+
+/*
+ * Test: Third-party enlistment shows in stats
+ */
+static struct test_result
+test_thirdparty_enlist_stats(void)
+{
+	int coalition_fd, keyvault_fd;
+	int ret;
+	struct vbsd_coalition_stat st;
+
+	/* Check if keyvault module is loaded */
+	keyvault_fd = open("/dev/keyvault", O_RDWR);
+	if (keyvault_fd < 0) {
+		if (errno == ENOENT)
+			return TEST_PASS("SKIPPED: /dev/keyvault not found");
+		return TEST_FAIL("open keyvault failed");
+	}
+
+	coalition_fd = create_coalition();
+	if (coalition_fd < 0) {
+		close(keyvault_fd);
+		return TEST_FAIL("Failed to create coalition");
+	}
+
+	/* Check initial stats */
+	ret = ioctl(coalition_fd, VBSD_COALITION_STAT, &st);
+	if (ret != 0) {
+		close(keyvault_fd);
+		close(coalition_fd);
+		return TEST_FAIL("Initial STAT failed");
+	}
+	if (st.vcs_other_count != 0) {
+		close(keyvault_fd);
+		close(coalition_fd);
+		return TEST_FAIL("Initial other_count should be 0");
+	}
+
+	/* Enlist keyvault */
+	ret = ioctl(coalition_fd, VBSD_COALITION_ENLIST, &keyvault_fd);
+	if (ret != 0) {
+		close(keyvault_fd);
+		close(coalition_fd);
+		return TEST_FAIL("Enlist keyvault failed");
+	}
+
+	/* Check stats after enlistment */
+	ret = ioctl(coalition_fd, VBSD_COALITION_STAT, &st);
+	if (ret != 0) {
+		close(keyvault_fd);
+		close(coalition_fd);
+		return TEST_FAIL("STAT after enlist failed");
+	}
+	if (st.vcs_member_count != 1) {
+		close(keyvault_fd);
+		close(coalition_fd);
+		return TEST_FAIL("member_count should be 1");
+	}
+	if (st.vcs_other_count != 1) {
+		close(keyvault_fd);
+		close(coalition_fd);
+		return TEST_FAIL("other_count should be 1");
+	}
+
+	close(keyvault_fd);
+	close(coalition_fd);
+	return TEST_PASS(NULL);
+}
+
+/*
+ * Test: Third-party leader clear breaks the link
+ */
+static struct test_result
+test_thirdparty_leader_clear(void)
+{
+	int coalition_fd, keyvault_fd, worker_fd;
+	pid_t worker_pid;
+	int ret, status;
+	int clear_fd = -1;
+
+	/* Check if keyvault module is loaded */
+	keyvault_fd = open("/dev/keyvault", O_RDWR);
+	if (keyvault_fd < 0) {
+		if (errno == ENOENT)
+			return TEST_PASS("SKIPPED: /dev/keyvault not found");
+		return TEST_FAIL("open keyvault failed");
+	}
+
+	coalition_fd = create_coalition();
+	if (coalition_fd < 0) {
+		close(keyvault_fd);
+		return TEST_FAIL("Failed to create coalition");
+	}
+
+	/* Create worker */
+	worker_pid = pdfork(&worker_fd, PD_DAEMON);
+	if (worker_pid < 0) {
+		close(keyvault_fd);
+		close(coalition_fd);
+		return TEST_FAIL("pdfork failed");
+	}
+	if (worker_pid == 0) {
+		close(keyvault_fd);
+		close(coalition_fd);
+		while (1)
+			sleep(10);
+		_exit(0);
+	}
+
+	/* Enlist keyvault and worker */
+	ret = ioctl(coalition_fd, VBSD_COALITION_ENLIST, &keyvault_fd);
+	if (ret != 0) {
+		pdkill(worker_fd, SIGKILL);
+		waitpid(worker_pid, NULL, 0);
+		close(worker_fd);
+		close(keyvault_fd);
+		close(coalition_fd);
+		return TEST_FAIL("Enlist keyvault failed");
+	}
+
+	ret = ioctl(coalition_fd, VBSD_COALITION_ENLIST, &worker_fd);
+	if (ret != 0) {
+		pdkill(worker_fd, SIGKILL);
+		waitpid(worker_pid, NULL, 0);
+		close(worker_fd);
+		close(keyvault_fd);
+		close(coalition_fd);
+		return TEST_FAIL("Enlist worker failed");
+	}
+
+	/* Set keyvault as leader */
+	ret = ioctl(coalition_fd, VBSD_COALITION_SET_LEADER, &keyvault_fd);
+	if (ret != 0) {
+		pdkill(worker_fd, SIGKILL);
+		waitpid(worker_pid, NULL, 0);
+		close(worker_fd);
+		close(keyvault_fd);
+		close(coalition_fd);
+		return TEST_FAIL("Set leader failed");
+	}
+
+	/* Clear the leader */
+	ret = ioctl(coalition_fd, VBSD_COALITION_SET_LEADER, &clear_fd);
+	if (ret != 0) {
+		pdkill(worker_fd, SIGKILL);
+		waitpid(worker_pid, NULL, 0);
+		close(worker_fd);
+		close(keyvault_fd);
+		close(coalition_fd);
+		return TEST_FAIL("Clear leader failed");
+	}
+
+	/* Revoke keyvault - should NOT trigger termination */
+	ret = ioctl(keyvault_fd, KEYVAULT_IOC_REVOKE);
+	if (ret != 0) {
+		pdkill(worker_fd, SIGKILL);
+		waitpid(worker_pid, NULL, 0);
+		close(worker_fd);
+		close(keyvault_fd);
+		close(coalition_fd);
+		return TEST_FAIL("Revoke failed");
+	}
+
+	usleep(100000);
+
+	/* Worker should still be alive */
+	ret = waitpid_timeout(worker_pid, &status, 300);
+	if (!(ret == 1 && errno == ETIMEDOUT)) {
+		close(worker_fd);
+		close(keyvault_fd);
+		close(coalition_fd);
+		return TEST_FAIL("Worker should still be alive");
+	}
+
+	pdkill(worker_fd, SIGKILL);
+	waitpid(worker_pid, NULL, 0);
+	close(worker_fd);
+	close(keyvault_fd);
+	close(coalition_fd);
+	return TEST_PASS(NULL);
+}
+
+/*
+ * Test: Change leader from third-party to process
+ */
+static struct test_result
+test_thirdparty_leader_change(void)
+{
+	int coalition_fd, keyvault_fd, leader_fd, worker_fd;
+	pid_t leader_pid, worker_pid;
+	int ret, status;
+	int pipe_fds[2];
+	char ready;
+
+	/* Check if keyvault module is loaded */
+	keyvault_fd = open("/dev/keyvault", O_RDWR);
+	if (keyvault_fd < 0) {
+		if (errno == ENOENT)
+			return TEST_PASS("SKIPPED: /dev/keyvault not found");
+		return TEST_FAIL("open keyvault failed");
+	}
+
+	coalition_fd = create_coalition();
+	if (coalition_fd < 0) {
+		close(keyvault_fd);
+		return TEST_FAIL("Failed to create coalition");
+	}
+
+	if (pipe(pipe_fds) < 0) {
+		close(keyvault_fd);
+		close(coalition_fd);
+		return TEST_FAIL("pipe failed");
+	}
+
+	/* Create leader process */
+	leader_pid = pdfork(&leader_fd, PD_DAEMON);
+	if (leader_pid < 0) {
+		close(pipe_fds[0]);
+		close(pipe_fds[1]);
+		close(keyvault_fd);
+		close(coalition_fd);
+		return TEST_FAIL("pdfork leader failed");
+	}
+	if (leader_pid == 0) {
+		close(pipe_fds[0]);
+		close(keyvault_fd);
+		close(coalition_fd);
+		write(pipe_fds[1], "R", 1);
+		close(pipe_fds[1]);
+		while (1)
+			sleep(10);
+		_exit(0);
+	}
+
+	/* Create worker process */
+	worker_pid = pdfork(&worker_fd, PD_DAEMON);
+	if (worker_pid < 0) {
+		pdkill(leader_fd, SIGKILL);
+		waitpid(leader_pid, NULL, 0);
+		close(leader_fd);
+		close(pipe_fds[0]);
+		close(pipe_fds[1]);
+		close(keyvault_fd);
+		close(coalition_fd);
+		return TEST_FAIL("pdfork worker failed");
+	}
+	if (worker_pid == 0) {
+		close(pipe_fds[0]);
+		close(pipe_fds[1]);
+		close(leader_fd);
+		close(keyvault_fd);
+		close(coalition_fd);
+		while (1)
+			sleep(10);
+		_exit(0);
+	}
+
+	close(pipe_fds[1]);
+
+	/* Wait for leader ready */
+	ret = read_ready_byte(pipe_fds[0], &ready, 1000);
+	close(pipe_fds[0]);
+	if (ret != 1) {
+		pdkill(leader_fd, SIGKILL);
+		pdkill(worker_fd, SIGKILL);
+		waitpid(leader_pid, NULL, 0);
+		waitpid(worker_pid, NULL, 0);
+		close(leader_fd);
+		close(worker_fd);
+		close(keyvault_fd);
+		close(coalition_fd);
+		return TEST_FAIL("Leader sync failed");
+	}
+
+	/* Enlist all members */
+	ret = ioctl(coalition_fd, VBSD_COALITION_ENLIST, &keyvault_fd);
+	ret |= ioctl(coalition_fd, VBSD_COALITION_ENLIST, &leader_fd);
+	ret |= ioctl(coalition_fd, VBSD_COALITION_ENLIST, &worker_fd);
+	if (ret != 0) {
+		pdkill(leader_fd, SIGKILL);
+		pdkill(worker_fd, SIGKILL);
+		waitpid(leader_pid, NULL, 0);
+		waitpid(worker_pid, NULL, 0);
+		close(leader_fd);
+		close(worker_fd);
+		close(keyvault_fd);
+		close(coalition_fd);
+		return TEST_FAIL("Enlist members failed");
+	}
+
+	/* Set keyvault as leader first */
+	ret = ioctl(coalition_fd, VBSD_COALITION_SET_LEADER, &keyvault_fd);
+	if (ret != 0) {
+		pdkill(leader_fd, SIGKILL);
+		pdkill(worker_fd, SIGKILL);
+		waitpid(leader_pid, NULL, 0);
+		waitpid(worker_pid, NULL, 0);
+		close(leader_fd);
+		close(worker_fd);
+		close(keyvault_fd);
+		close(coalition_fd);
+		return TEST_FAIL("Set keyvault as leader failed");
+	}
+
+	/* Change leader to process */
+	ret = ioctl(coalition_fd, VBSD_COALITION_SET_LEADER, &leader_fd);
+	if (ret != 0) {
+		pdkill(leader_fd, SIGKILL);
+		pdkill(worker_fd, SIGKILL);
+		waitpid(leader_pid, NULL, 0);
+		waitpid(worker_pid, NULL, 0);
+		close(leader_fd);
+		close(worker_fd);
+		close(keyvault_fd);
+		close(coalition_fd);
+		return TEST_FAIL("Change leader to process failed");
+	}
+
+	/* Revoke keyvault - should NOT trigger termination */
+	ret = ioctl(keyvault_fd, KEYVAULT_IOC_REVOKE);
+	if (ret != 0) {
+		pdkill(leader_fd, SIGKILL);
+		pdkill(worker_fd, SIGKILL);
+		waitpid(leader_pid, NULL, 0);
+		waitpid(worker_pid, NULL, 0);
+		close(leader_fd);
+		close(worker_fd);
+		close(keyvault_fd);
+		close(coalition_fd);
+		return TEST_FAIL("Revoke keyvault failed");
+	}
+
+	usleep(100000);
+
+	/* Worker should still be alive */
+	ret = waitpid_timeout(worker_pid, &status, 300);
+	if (!(ret == 1 && errno == ETIMEDOUT)) {
+		pdkill(leader_fd, SIGKILL);
+		waitpid(leader_pid, NULL, 0);
+		close(leader_fd);
+		close(worker_fd);
+		close(keyvault_fd);
+		close(coalition_fd);
+		return TEST_FAIL("Worker died after keyvault revoke");
+	}
+
+	/* Kill the leader process - NOW coalition should terminate */
+	pdkill(leader_fd, SIGKILL);
+	waitpid(leader_pid, NULL, 0);
+
+	/* Worker should be terminated */
+	ret = waitpid_timeout(worker_pid, &status, 2000);
+	if (ret != 0) {
+		pdkill(worker_fd, SIGKILL);
+		waitpid(worker_pid, NULL, 0);
+		close(leader_fd);
+		close(worker_fd);
+		close(keyvault_fd);
+		close(coalition_fd);
+		return TEST_FAIL("Worker should have been killed after leader death");
+	}
+
+	close(leader_fd);
+	close(worker_fd);
+	close(keyvault_fd);
+	close(coalition_fd);
+	return TEST_PASS(NULL);
+}
+
+#endif /* HAVE_KEYVAULT */
+
 /* =========================================================================
  * NESTED COALITION TESTS
  * ========================================================================= */
@@ -5848,6 +6443,23 @@ main(int argc __unused, char *argv[] __unused)
 	    "Coalition leader death trigger", test_leader_coalition);
 	test_harness_register("test_leader_coalition_clear",
 	    "Clear coalition leader breaks link", test_leader_coalition_clear);
+#ifdef HAVE_KEYVAULT
+	test_harness_register("test_leader_thirdparty_keyvault",
+	    "Third-party (keyvault) leader revoke triggers termination",
+	    test_leader_thirdparty_keyvault);
+	test_harness_register("test_thirdparty_terminate_callback",
+	    "Coalition terminate invokes mo_terminate on keyvault",
+	    test_thirdparty_terminate_callback);
+	test_harness_register("test_thirdparty_enlist_stats",
+	    "Third-party enlistment shows in stats",
+	    test_thirdparty_enlist_stats);
+	test_harness_register("test_thirdparty_leader_clear",
+	    "Third-party leader clear breaks link",
+	    test_thirdparty_leader_clear);
+	test_harness_register("test_thirdparty_leader_change",
+	    "Change leader from third-party to process",
+	    test_thirdparty_leader_change);
+#endif
 
 	/* Nested coalition tests */
 	test_harness_register("test_nested_coalition_basic",
