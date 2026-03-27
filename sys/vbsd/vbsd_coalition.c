@@ -5,7 +5,16 @@
  *
  * vBSD Coalition - Capability-based Resource Group Management
  *
- * Lock order: vbsd_proc_hash_lock -> vc_sx
+ * Lock order (acquire in this order to prevent deadlock):
+ *   vbsd_proc_hash_lock (rwlock)
+ *   vbsd_leader_hash_lock (mutex)
+ *   vbsd_external_ops_lock (mutex)
+ *   vc_sx (sx lock, per-coalition)
+ *   child vc_sx (nested coalitions: parent before child)
+ *
+ * Note: vbsd_leader_hash_lock may be held while acquiring vc_sx,
+ * but only to take a coalition reference. The lock is released
+ * before any coalition operations.
  */
 
 #define _VBSD_COALITION_INTERNAL
@@ -82,6 +91,7 @@ struct vbsd_external_ops {
 	LIST_ENTRY(vbsd_external_ops)	link;
 	int				dtype;
 	struct vbsd_member_ops		*ops;
+	volatile u_int			refcount;	/* Active member count */
 };
 
 static LIST_HEAD(, vbsd_external_ops) vbsd_external_ops_list =
@@ -123,6 +133,10 @@ vbsd_member_ops_deregister(int dtype)
 	mtx_lock(&vbsd_external_ops_lock);
 	LIST_FOREACH(entry, &vbsd_external_ops_list, link) {
 		if (entry->dtype == dtype) {
+			if (entry->refcount > 0) {
+				mtx_unlock(&vbsd_external_ops_lock);
+				return (EBUSY);
+			}
 			LIST_REMOVE(entry, link);
 			mtx_unlock(&vbsd_external_ops_lock);
 			free(entry, M_VBSD_COALITION);
@@ -163,6 +177,48 @@ vbsd_member_ops_get(int dtype)
 	mtx_unlock(&vbsd_external_ops_lock);
 
 	return (&vbsd_default_ops);
+}
+
+/*
+ * Reference count external ops when members are enlisted/removed.
+ * This prevents module unload while members are active.
+ */
+static void
+vbsd_external_ops_ref(int dtype)
+{
+	struct vbsd_external_ops *entry;
+
+	if (dtype < 64)
+		return;	/* Built-in types don't need refcounting */
+
+	mtx_lock(&vbsd_external_ops_lock);
+	LIST_FOREACH(entry, &vbsd_external_ops_list, link) {
+		if (entry->dtype == dtype) {
+			atomic_add_int(&entry->refcount, 1);
+			break;
+		}
+	}
+	mtx_unlock(&vbsd_external_ops_lock);
+}
+
+static void
+vbsd_external_ops_rel(int dtype)
+{
+	struct vbsd_external_ops *entry;
+
+	if (dtype < 64)
+		return;	/* Built-in types don't need refcounting */
+
+	mtx_lock(&vbsd_external_ops_lock);
+	LIST_FOREACH(entry, &vbsd_external_ops_list, link) {
+		if (entry->dtype == dtype) {
+			KASSERT(entry->refcount > 0,
+			    ("vbsd: external ops refcount underflow"));
+			atomic_subtract_int(&entry->refcount, 1);
+			break;
+		}
+	}
+	mtx_unlock(&vbsd_external_ops_lock);
 }
 
 /* UMA Zones and Global State */
@@ -219,7 +275,6 @@ vbsd_leader_hash_index(struct file *fp)
 }
 
 static void vbsd_leader_hash_insert(struct file *fp, struct vbsd_member *vm);
-static struct vbsd_member *vbsd_leader_hash_lookup(struct file *fp);
 static void vbsd_leader_hash_remove(struct file *fp);
 static void vbsd_leader_died_handler(void *arg, struct file *fp);
 
@@ -1132,6 +1187,9 @@ vbsd_coalition_enlist_generic(struct vbsd_coalition *vc, struct thread *td,
 	vm->vm_ops = ops;
 	vm->vm_coalition = vc;
 	TAILQ_INSERT_TAIL(&vc->vc_members, vm, vm_link);
+
+	/* Track external module member count for safe unload */
+	vbsd_external_ops_ref(dtype);
 
 	/*
 	 * For jails, set the member back-pointer in the OSD so the
@@ -2453,6 +2511,9 @@ vbsd_coalition_fo_close(struct file *fp, struct thread *td)
 		if (vm->vm_ops != &vbsd_coalition_ops)
 			atomic_subtract_int(&vbsd_member_count, 1);
 
+		/* Release external module refcount */
+		vbsd_external_ops_rel(vm->vm_dtype);
+
 		if (vm->vm_fp != NULL)
 			fdrop(vm->vm_fp, td);
 
@@ -2511,6 +2572,9 @@ vbsd_coalition_fo_close(struct file *fp, struct thread *td)
 
 		atomic_subtract_int(&vc->vc_member_count, 1);
 		atomic_subtract_int(&vbsd_member_count, 1);
+
+		/* Release external module refcount (no-op for built-in types) */
+		vbsd_external_ops_rel(vm->vm_dtype);
 
 		/* Release file reference */
 		if (vm->vm_fp != NULL)
@@ -2583,8 +2647,11 @@ vbsd_leader_hash_fini(void)
 static void
 vbsd_leader_hash_insert(struct file *fp, struct vbsd_member *vm)
 {
-	struct vbsd_leader_entry *vle;
+	struct vbsd_leader_entry *vle, *existing;
 	u_int idx;
+
+	KASSERT(fp != NULL, ("vbsd_leader_hash_insert: NULL fp"));
+	KASSERT(vm != NULL, ("vbsd_leader_hash_insert: NULL vm"));
 
 	vle = malloc(sizeof(*vle), M_VBSD_COALITION, M_WAITOK);
 	vle->vle_fp = fp;
@@ -2592,27 +2659,18 @@ vbsd_leader_hash_insert(struct file *fp, struct vbsd_member *vm)
 
 	mtx_lock(&vbsd_leader_hash_lock);
 	idx = vbsd_leader_hash_index(fp);
-	LIST_INSERT_HEAD(&vbsd_leader_hash[idx], vle, vle_link);
-	mtx_unlock(&vbsd_leader_hash_lock);
-}
 
-static struct vbsd_member *
-vbsd_leader_hash_lookup(struct file *fp)
-{
-	struct vbsd_leader_entry *vle;
-	struct vbsd_member *vm = NULL;
-	u_int idx;
-
-	mtx_lock(&vbsd_leader_hash_lock);
-	idx = vbsd_leader_hash_index(fp);
-	LIST_FOREACH(vle, &vbsd_leader_hash[idx], vle_link) {
-		if (vle->vle_fp == fp) {
-			vm = vle->vle_member;
-			break;
+	/* Check for duplicates - same fp should not be in hash twice */
+	LIST_FOREACH(existing, &vbsd_leader_hash[idx], vle_link) {
+		if (existing->vle_fp == fp) {
+			mtx_unlock(&vbsd_leader_hash_lock);
+			free(vle, M_VBSD_COALITION);
+			return;	/* Already present, no-op */
 		}
 	}
+
+	LIST_INSERT_HEAD(&vbsd_leader_hash[idx], vle, vle_link);
 	mtx_unlock(&vbsd_leader_hash_lock);
-	return (vm);
 }
 
 static void
@@ -2620,6 +2678,8 @@ vbsd_leader_hash_remove(struct file *fp)
 {
 	struct vbsd_leader_entry *vle;
 	u_int idx;
+
+	KASSERT(fp != NULL, ("vbsd_leader_hash_remove: NULL fp"));
 
 	mtx_lock(&vbsd_leader_hash_lock);
 	idx = vbsd_leader_hash_index(fp);
@@ -2637,26 +2697,51 @@ vbsd_leader_hash_remove(struct file *fp)
 /*
  * Third-party leader death event handler.
  * Called when a third-party module fires VBSD_LEADER_DIED(fp).
+ *
+ * Must handle the case where the coalition is being destroyed concurrently.
+ * We hold a reference on the coalition before releasing the hash lock to
+ * prevent use-after-free.
  */
 static void
 vbsd_leader_died_handler(void *arg __unused, struct file *fp)
 {
+	struct vbsd_leader_entry *vle;
 	struct vbsd_member *vm;
 	struct vbsd_coalition *vc;
+	u_int idx;
 
-	vm = vbsd_leader_hash_lookup(fp);
-	if (vm == NULL)
+	/*
+	 * Look up under hash lock and take coalition reference before
+	 * releasing to prevent TOCTOU race with coalition destruction.
+	 */
+	mtx_lock(&vbsd_leader_hash_lock);
+	idx = vbsd_leader_hash_index(fp);
+	LIST_FOREACH(vle, &vbsd_leader_hash[idx], vle_link) {
+		if (vle->vle_fp == fp)
+			break;
+	}
+	if (vle == NULL) {
+		mtx_unlock(&vbsd_leader_hash_lock);
 		return;
+	}
 
+	vm = vle->vle_member;
 	vc = vm->vm_coalition;
-	if (vc == NULL)
+	if (vc == NULL) {
+		mtx_unlock(&vbsd_leader_hash_lock);
 		return;
+	}
+
+	/* Hold reference before releasing hash lock */
+	vbsd_coalition_ref(vc);
+	mtx_unlock(&vbsd_leader_hash_lock);
 
 	sx_xlock(&vc->vc_sx);
 
 	/* Verify this is still the leader and not already terminating */
 	if (vc->vc_leader != vm || (vc->vc_flags & VCF_TERMINATING)) {
 		sx_xunlock(&vc->vc_sx);
+		vbsd_coalition_rel(vc);
 		return;
 	}
 
@@ -2670,6 +2755,7 @@ vbsd_leader_died_handler(void *arg __unused, struct file *fp)
 	vbsd_coalition_terminate_members_locked(vc, curthread, false);
 
 	sx_xunlock(&vc->vc_sx);
+	vbsd_coalition_rel(vc);
 }
 
 static int

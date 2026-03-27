@@ -174,17 +174,49 @@ close(coalition_fd);
 struct vbsd_member_ops {
     int         (*mo_terminate)(struct file *fp, struct thread *td);
     const char  *mo_name;
+    uint32_t    mo_flags;       /* MOF_* flags */
 };
+
+/* mo_flags */
+#define MOF_CAN_LEAD    0x0001  /* This type can be a coalition leader */
 
 /*
  * Register ops for a custom descriptor type. Coalition assigns the dtype.
  * Use the returned dtype in finit() when creating descriptors.
+ *
+ * Returns: 0 on success, dtype stored in *dtype_out
+ * Errors:
+ *   EINVAL - ops/dtype_out NULL, or mo_terminate NULL
+ *   ENOSPC - too many external types registered
  */
 int vbsd_member_ops_register(struct vbsd_member_ops *ops, int *dtype_out);
+
+/*
+ * Deregister ops for a custom descriptor type.
+ *
+ * Returns: 0 on success
+ * Errors:
+ *   ENOENT - dtype not found
+ *   EBUSY  - active members using this dtype (cannot unload)
+ */
 int vbsd_member_ops_deregister(int dtype);
 
 /* Check if coalition module is loaded (for optional integration) */
 bool vbsd_coalition_available(void);
+
+/*
+ * Third-party leader death notification.
+ *
+ * If your custom descriptor type can be a coalition leader (MOF_CAN_LEAD),
+ * fire this event when the resource dies/is revoked. Coalition handles
+ * the lookup and triggers termination.
+ *
+ * Usage in your revoke/close handler:
+ *     VBSD_LEADER_DIED(fp);
+ *
+ * The coalition module registers an EVENTHANDLER for this event.
+ */
+#define VBSD_LEADER_DIED(fp)  EVENTHANDLER_INVOKE(vbsd_leader_died, fp)
 ```
 
 ## Implementing Coalition Support in Your Module
@@ -231,6 +263,53 @@ your_fdopen(struct cdev *dev, int oflags, struct thread *td, struct file *fp)
 vbsd_member_ops_deregister(your_dtype);
 ```
 
+### Implementing Third-Party Leader Support
+
+If your custom descriptor type should be able to act as a coalition leader
+(triggering termination when it dies/is revoked), set `MOF_CAN_LEAD` in your ops
+and fire `VBSD_LEADER_DIED` when the resource dies:
+
+```c
+static struct vbsd_member_ops your_ops = {
+    .mo_terminate = your_terminate,
+    .mo_name      = "yourtype",
+    .mo_flags     = MOF_CAN_LEAD,   /* Allow as coalition leader */
+};
+
+/* In your revoke/close/death handler */
+static int
+your_revoke(struct your_data *yd)
+{
+    struct file *fp;
+
+    YOUR_LOCK(yd);
+    yd->revoked = true;
+    fp = yd->yd_fp;    /* fp stored during fdopen */
+    YOUR_UNLOCK(yd);
+
+    /* Notify coalition if this was a leader */
+    if (fp != NULL && vbsd_coalition_available())
+        VBSD_LEADER_DIED(fp);
+
+    return (0);
+}
+
+/* In d_fdopen: store fp for later VBSD_LEADER_DIED */
+static int
+your_fdopen(struct cdev *dev, int oflags, struct thread *td, struct file *fp)
+{
+    struct your_data *yd = your_alloc();
+    yd->yd_fp = fp;    /* Store for VBSD_LEADER_DIED */
+    finit(fp, FREAD | FWRITE, your_dtype, yd, &your_fileops);
+    return (0);
+}
+```
+
+**Note**: The `fp` pointer is safe to use after releasing your lock because:
+1. The ioctl caller holds an fd reference to the file
+2. `fo_close` is only called when the last reference is dropped
+3. If you're inside an ioctl, the file won't be freed until you return
+
 ## Handling Natural Exit
 
 Some resources have a natural lifecycle (processes die, jails are removed). The coalition tracks these exits automatically.
@@ -257,10 +336,17 @@ These don't have natural exit events:
 
 ```
 vbsd_proc_hash_lock (rwlock)
-    → vc_sx (coalition sx lock)
+    → vbsd_leader_hash_lock (mutex)
+        → vbsd_external_ops_lock (mutex)
+            → vc_sx (coalition sx lock)
+                → child vc_sx (nested coalitions: parent before child)
 ```
 
 When acquiring multiple locks, always follow this order to prevent deadlock.
+
+**Note**: `vbsd_leader_hash_lock` may be held while acquiring `vc_sx`, but only
+to take a coalition reference. The lock is released before any coalition
+operations to avoid holding a mutex across potentially blocking operations.
 
 ## Error Handling
 
@@ -268,11 +354,13 @@ When acquiring multiple locks, always follow this order to prevent deadlock.
 |-------|---------|
 | EOPNOTSUPP | No ops registered for this file type (only for invalid dtype) |
 | EBUSY | Resource already enlisted in a coalition; or ops deregister with active members |
-| EINVAL | Coalition is terminating, cannot enlist; or batch count exceeds limit |
+| EINVAL | Coalition is terminating, cannot enlist; or batch count exceeds limit; or invalid leader type |
 | EBADF | File descriptor invalid or already closed |
-| ESRCH | Process/jail no longer exists |
+| ESRCH | Process/jail no longer exists; or leader fd not enlisted in coalition |
 | ESHUTDOWN | Coalition already terminated (second terminate call) |
 | ENOMEM | Resource limit exceeded (max coalitions or max members) |
+| ELOOP | Nesting depth limit exceeded (VBSD_MAX_NESTING_DEPTH) |
+| ENOSPC | Too many external dtype registrations |
 
 **Note:** On successful enlistment, the caller retains their fd (reference semantics).
 The coalition holds its own reference via `fhold()`. Caller can continue using the fd
@@ -434,10 +522,12 @@ ioctl(coalition_fd, VBSD_COALITION_SET_LEADER, &no_leader);
 - Process (procdesc): triggers on process exit
 - Jail (jaildesc): triggers on jail destruction
 - Coalition: triggers when nested coalition terminates
+- Third-party types with `MOF_CAN_LEAD` flag: triggers when module fires `VBSD_LEADER_DIED(fp)`
 
 **Requirements**:
 - The member must be enlisted in the coalition (ESRCH if not)
-- The fd must be a process, jail, or coalition (EINVAL for other types)
+- For built-in types: must be process, jail, or coalition (EINVAL for other types)
+- For third-party types: `mo_flags` must include `MOF_CAN_LEAD` (EINVAL otherwise)
 - Cannot set leader on a terminated coalition (ESHUTDOWN)
 
 **Behavior**:
@@ -493,6 +583,57 @@ if (ioctl(coalition_fd, VBSD_COALITION_RUSAGE, &ru) == 0) {
 - Quota enforcement: check if coalition exceeds limits
 - Billing: measure resource consumption for accounting
 
+## Kqueue Event Notifications
+
+Coalition file descriptors support kqueue for asynchronous event notification.
+Register with `EVFILT_READ` and check `fflags` for event type:
+
+```c
+struct kevent kev;
+EV_SET(&kev, coalition_fd, EVFILT_READ, EV_ADD | EV_CLEAR, 0, 0, NULL);
+kevent(kq, &kev, 1, NULL, 0, NULL);
+
+/* Wait for events */
+int n = kevent(kq, NULL, 0, &kev, 1, NULL);
+if (n > 0) {
+    if (kev.fflags & VBSD_NOTE_MEMBER_ADDED)
+        printf("New member enlisted\n");
+    if (kev.fflags & VBSD_NOTE_MEMBER_REMOVED)
+        printf("Member exited/removed\n");
+    if (kev.fflags & VBSD_NOTE_TERMINATING)
+        printf("Termination started\n");
+    if (kev.fflags & VBSD_NOTE_TERMINATED)
+        printf("All members terminated\n");
+    if (kev.fflags & VBSD_NOTE_LEADER_DIED)
+        printf("Leader death triggered termination\n");
+    if (kev.fflags & VBSD_NOTE_DEADLINE_FIRED)
+        printf("Deadline timer expired\n");
+    if (kev.fflags & VBSD_NOTE_WATCHDOG_FIRED)
+        printf("Watchdog timeout\n");
+    if (kev.fflags & VBSD_NOTE_GRACE_STARTED)
+        printf("Grace period began\n");
+}
+```
+
+**Event flags** (delivered in `kev.fflags`):
+
+| Flag | Value | Description |
+|------|-------|-------------|
+| `VBSD_NOTE_MEMBER_ADDED` | 0x0001 | New member enlisted |
+| `VBSD_NOTE_MEMBER_REMOVED` | 0x0002 | Member exited/removed |
+| `VBSD_NOTE_TERMINATING` | 0x0004 | Termination started |
+| `VBSD_NOTE_TERMINATED` | 0x0008 | All members terminated |
+| `VBSD_NOTE_LEADER_DIED` | 0x0010 | Leader death triggered termination |
+| `VBSD_NOTE_DEADLINE_FIRED` | 0x0020 | Deadline timer expired |
+| `VBSD_NOTE_WATCHDOG_FIRED` | 0x0040 | Watchdog timeout |
+| `VBSD_NOTE_GRACE_STARTED` | 0x0080 | Grace period began |
+| `VBSD_NOTE_ALL` | 0x00FF | Mask for all events |
+
+**Use cases**:
+- Monitoring: watch for member exits or termination
+- Logging: track coalition lifecycle events
+- Integration: react to deadline/watchdog/leader events
+
 ## Project Structure
 
 ```
@@ -507,12 +648,37 @@ SecurityCoalitions/
 │   └── modules/
 │       └── vbsd_coalition/
 │           └── Makefile        # Kernel module Makefile
+├── samples/
+│   └── keyvault/
+│       ├── Makefile            # Keyvault module Makefile
+│       ├── vbsd_keyvault.c     # Sample coalition-integrated module
+│       └── vbsd_keyvault.h     # Keyvault API header
+├── scripts/
+│   ├── deploy-to-vm.sh         # Build locally, deploy to VM for testing
+│   └── vm-test.sh              # Load modules and run tests on VM
 └── tests/
     ├── Makefile
     ├── test_harness.h
     ├── test_harness.c
     ├── coalition_test.c        # Test suite
+    ├── stress_test.c           # Stress/performance tests
     └── test_helper.c           # Helper binary
+```
+
+### Sample: KeyVault Module
+
+The `samples/keyvault/` directory contains a complete example of a third-party
+kernel module integrating with coalition:
+
+- Custom descriptor type with interior revocation
+- Coalition terminate callback (zeros cryptographic keys)
+- `MOF_CAN_LEAD` flag (keyvault can be coalition leader)
+- `VBSD_LEADER_DIED` event on key revocation
+
+Build and load:
+```sh
+make -C samples
+sudo kldload ./samples/keyvault/vbsd_keyvault.ko
 ```
 
 ## Test Matrix
@@ -612,6 +778,11 @@ SecurityCoalitions/
 | Nested depth tracking | `test_nested_coalition_depth` | depth correct |
 | Nested self-enlist | `test_nested_coalition_self_enlist` | EINVAL |
 | Nested depth limit | `test_nested_coalition_depth_limit` | ELOOP at limit |
+| Third-party leader | `test_leader_thirdparty_keyvault` | keyvault revoke triggers termination |
+| Third-party terminate | `test_thirdparty_terminate_callback` | mo_terminate called on coalition close |
+| Third-party stats | `test_thirdparty_enlist_stats` | stats reflect keyvault member |
+| Third-party leader clear | `test_thirdparty_leader_clear` | clearing leader prevents trigger |
+| Third-party leader change | `test_thirdparty_leader_change` | A→B, A's death doesn't trigger |
 
 ## Build & Test
 

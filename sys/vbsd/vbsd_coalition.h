@@ -165,7 +165,10 @@ struct prison;
 #define VCF_WATCHDOG_ACTIVE	0x0008	/* Watchdog timer is running */
 #define VCF_HAS_LEADER		0x0010	/* Leader process is set */
 
-/* Lock order: vbsd_proc_hash_lock -> vc_sx */
+/*
+ * Lock order: vbsd_proc_hash_lock -> vbsd_leader_hash_lock -> vc_sx
+ * See vbsd_coalition.c for full lock ordering documentation.
+ */
 struct vbsd_coalition {
 	struct sx			vc_sx;
 	TAILQ_HEAD(, vbsd_member)	vc_members;
