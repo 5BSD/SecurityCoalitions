@@ -47,25 +47,6 @@ MALLOC_DEFINE(M_KEYVAULT, "keyvault", "KeyVault structures");
 static uma_zone_t keyvault_zone;
 static struct cdev *keyvault_dev;
 
-/* Forward declarations */
-static fo_close_t	keyvault_fo_close;
-static fo_ioctl_t	keyvault_fo_ioctl;
-static fo_stat_t	keyvault_fo_stat;
-
-static struct fileops keyvault_fileops = {
-	.fo_read = invfo_rdwr,
-	.fo_write = invfo_rdwr,
-	.fo_truncate = invfo_truncate,
-	.fo_ioctl = keyvault_fo_ioctl,
-	.fo_poll = invfo_poll,
-	.fo_kqfilter = invfo_kqfilter,
-	.fo_stat = keyvault_fo_stat,
-	.fo_close = keyvault_fo_close,
-	.fo_chmod = invfo_chmod,
-	.fo_chown = invfo_chown,
-	.fo_sendfile = invfo_sendfile,
-	.fo_flags = DFLAG_PASSABLE,
-};
 
 /* ========================================================================
  * Coalition Integration
@@ -76,15 +57,13 @@ static struct fileops keyvault_fileops = {
  * the coalition containing this keyvault is terminated.
  */
 static int
-keyvault_coalition_terminate(struct file *fp, struct thread *td __unused)
+keyvault_coalition_terminate(void *priv, struct thread *td __unused)
 {
-	struct keyvault *kv;
+	struct keyvault *kv = priv;
 	int i;
 
-	if (fp == NULL || fp->f_data == NULL)
+	if (kv == NULL)
 		return (EINVAL);
-
-	kv = fp->f_data;
 
 	KEYVAULT_LOCK(kv);
 	kv->kv_revoked = true;
@@ -102,10 +81,10 @@ keyvault_coalition_terminate(struct file *fp, struct thread *td __unused)
 	return (0);
 }
 
-static struct vbsd_member_ops keyvault_coalition_ops = {
-	.mo_terminate = keyvault_coalition_terminate,
-	.mo_name = "keyvault",
-	.mo_flags = MOF_CAN_LEAD,	/* Keyvault can be coalition leader */
+static struct vbsd_terminate_ops keyvault_terminate_ops = {
+	.vto_terminate = keyvault_coalition_terminate,
+	.vto_name = "keyvault",
+	.vto_flags = VTO_CAN_LEAD,	/* Keyvault can be coalition leader */
 };
 
 /* ========================================================================
@@ -229,13 +208,11 @@ keyvault_delete(struct keyvault *kv, uint32_t slot)
 static int
 keyvault_revoke(struct keyvault *kv)
 {
-	struct file *fp;
 	int i;
 
 	KEYVAULT_LOCK(kv);
 
 	kv->kv_revoked = true;
-	fp = kv->kv_fp;
 
 	for (i = 0; i < KEYVAULT_MAX_SLOTS; i++) {
 		if (kv->kv_slots[i].ks_valid) {
@@ -256,23 +233,56 @@ keyvault_revoke(struct keyvault *kv)
 	 * This is a security feature: if key material is compromised,
 	 * all dependent processes are terminated.
 	 */
-	if (fp != NULL && vbsd_coalition_available())
-		VBSD_LEADER_DIED(fp);
+	if (kv->kv_cdev != NULL && vbsd_coalition_available())
+		VBSD_LEADER_DIED(kv->kv_cdev, kv);
 
 	return (0);
 }
 
+
 /* ========================================================================
- * File Operations
+ * Device Operations
  * ======================================================================== */
 
+static void
+keyvault_dtor(void *arg)
+{
+	struct keyvault *kv = arg;
+
+	keyvault_free(kv);
+}
+
 static int
-keyvault_fo_ioctl(struct file *fp, u_long cmd, void *data,
-    struct ucred *active_cred __unused, struct thread *td __unused)
+keyvault_open(struct cdev *dev, int oflags __unused, int devtype __unused,
+    struct thread *td __unused)
 {
 	struct keyvault *kv;
 
-	kv = fp->f_data;
+	kv = keyvault_alloc();
+	kv->kv_cdev = dev;	/* Store for VBSD_LEADER_DIED */
+	devfs_set_cdevpriv(kv, keyvault_dtor);
+
+	return (0);
+}
+
+static int
+keyvault_close(struct cdev *dev __unused, int fflag __unused,
+    int devtype __unused, struct thread *td __unused)
+{
+	/* Cleanup handled by dtor */
+	return (0);
+}
+
+static int
+keyvault_ioctl(struct cdev *dev __unused, u_long cmd, caddr_t data,
+    int fflag __unused, struct thread *td __unused)
+{
+	struct keyvault *kv;
+	int error;
+
+	error = devfs_get_cdevpriv((void **)&kv);
+	if (error != 0)
+		return (error);
 
 	switch (cmd) {
 	case KEYVAULT_IOC_STORE:
@@ -292,49 +302,11 @@ keyvault_fo_ioctl(struct file *fp, u_long cmd, void *data,
 	}
 }
 
-static int
-keyvault_fo_stat(struct file *fp __unused, struct stat *sb,
-    struct ucred *active_cred __unused)
-{
-
-	bzero(sb, sizeof(*sb));
-	sb->st_mode = S_IFCHR | 0600;
-	return (0);
-}
-
-static int
-keyvault_fo_close(struct file *fp, struct thread *td __unused)
-{
-	struct keyvault *kv;
-
-	kv = fp->f_data;
-	keyvault_free(kv);
-	return (0);
-}
-
-/* ========================================================================
- * Device Operations
- * ======================================================================== */
-
-/* Assigned by coalition module at registration */
-static int keyvault_dtype = DTYPE_NONE;
-
-static int
-keyvault_fdopen(struct cdev *dev __unused, int oflags __unused,
-    struct thread *td __unused, struct file *fp)
-{
-	struct keyvault *kv;
-
-	kv = keyvault_alloc();
-	kv->kv_fp = fp;		/* Store for VBSD_LEADER_DIED */
-	finit(fp, FREAD | FWRITE, keyvault_dtype, kv, &keyvault_fileops);
-
-	return (0);
-}
-
 static struct cdevsw keyvault_cdevsw = {
 	.d_version = D_VERSION,
-	.d_fdopen = keyvault_fdopen,
+	.d_open = keyvault_open,
+	.d_close = keyvault_close,
+	.d_ioctl = keyvault_ioctl,
 	.d_name = "keyvault",
 };
 
@@ -353,33 +325,31 @@ keyvault_modevent(module_t mod __unused, int type, void *arg __unused)
 		    sizeof(struct keyvault), NULL, NULL, NULL, NULL,
 		    UMA_ALIGN_PTR, 0);
 
-		/* Register with coalition - get assigned dtype */
-		if (vbsd_coalition_available()) {
-			error = vbsd_member_ops_register(&keyvault_coalition_ops,
-			    &keyvault_dtype);
-			if (error != 0) {
-				log(LOG_WARNING,
-				    "keyvault: coalition register failed: %d\n",
-				    error);
-				uma_zdestroy(keyvault_zone);
-				return (error);
-			}
-		}
-
 		keyvault_dev = make_dev(&keyvault_cdevsw, 0,
 		    UID_ROOT, GID_WHEEL, 0600, "keyvault");
 		if (keyvault_dev == NULL) {
-			vbsd_member_ops_deregister(keyvault_dtype);
 			uma_zdestroy(keyvault_zone);
 			return (ENXIO);
 		}
 
-		log(LOG_INFO, "keyvault: loaded (dtype %d)\n", keyvault_dtype);
+		/* Register termination handler with coalition (if loaded) */
+		error = VBSD_TERMINATE_OPS_REGISTER(keyvault_dev,
+		    &keyvault_terminate_ops);
+		if (error != 0) {
+			log(LOG_WARNING,
+			    "keyvault: coalition register failed: %d\n",
+			    error);
+			destroy_dev(keyvault_dev);
+			uma_zdestroy(keyvault_zone);
+			return (error);
+		}
+
+		log(LOG_INFO, "keyvault: loaded\n");
 		return (0);
 
 	case MOD_UNLOAD:
+		VBSD_TERMINATE_OPS_DEREGISTER(keyvault_dev);
 		destroy_dev(keyvault_dev);
-		vbsd_member_ops_deregister(keyvault_dtype);
 		uma_zdestroy(keyvault_zone);
 		return (0);
 

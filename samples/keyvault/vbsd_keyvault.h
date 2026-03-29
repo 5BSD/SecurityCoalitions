@@ -45,12 +45,13 @@ struct keyvault_key {
 
 #ifdef _KERNEL
 
+#include <sys/conf.h>
 #include <sys/lock.h>
 #include <sys/mutex.h>
 
 /*
- * DTYPE is assigned dynamically by vbsd_coalition at registration.
- * No need for a static define - coalition manages dtype allocation.
+ * KeyVault uses standard DTYPE_VNODE via devfs_set_cdevpriv().
+ * Coalition termination handlers are registered by cdev, not dtype.
  */
 
 /*
@@ -68,7 +69,7 @@ struct keyvault_slot {
 struct keyvault {
 	struct mtx		kv_lock;
 	bool			kv_revoked;	/* Set by coalition terminate */
-	struct file		*kv_fp;		/* Back-pointer for VBSD_LEADER_DIED */
+	struct cdev		*kv_cdev;	/* Back-pointer for VBSD_LEADER_DIED */
 	struct keyvault_slot	kv_slots[KEYVAULT_MAX_SLOTS];
 };
 

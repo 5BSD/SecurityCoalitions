@@ -106,44 +106,49 @@ struct vbsd_coalition_rusage {
 /* Public API */
 
 /*
- * Third-party member operations.
+ * Termination operations for cdev-based custom devices.
  *
- * Modules register ops to integrate custom descriptor types with coalitions.
- * Set mo_flags to indicate capabilities (e.g., MOF_CAN_LEAD).
+ * Modules using devfs_set_cdevpriv() register termination handlers here.
+ * When a coalition containing the device is terminated, the handler is
+ * called with the devfs private data.
  */
-struct vbsd_member_ops {
-	int		(*mo_terminate)(struct file *fp, struct thread *td);
-	const char	*mo_name;
-	uint32_t	mo_flags;
+struct vbsd_terminate_ops {
+	int		(*vto_terminate)(void *priv, struct thread *td);
+	const char	*vto_name;
+	uint32_t	vto_flags;
 };
 
-/* mo_flags */
-#define MOF_CAN_LEAD	0x0001	/* This type can be a coalition leader */
+/* vto_flags */
+#define VTO_CAN_LEAD	0x0001	/* This device can be a coalition leader */
 
 /*
- * Register ops for a new descriptor type. Coalition assigns the dtype.
- * Returns 0 on success, dtype is stored in *dtype_out.
- * Use the returned dtype in finit() when creating your descriptors.
+ * Register termination ops for a cdev. The cdev must already exist.
+ * When fds opened from this cdev are enlisted in a coalition, the
+ * coalition will call vto_terminate() on coalition close.
  */
-int	vbsd_member_ops_register(struct vbsd_member_ops *ops, int *dtype_out);
-int	vbsd_member_ops_deregister(int dtype);
+int	vbsd_terminate_ops_register(struct cdev *dev,
+	    struct vbsd_terminate_ops *ops);
+int	vbsd_terminate_ops_deregister(struct cdev *dev);
 
 /*
- * Leader death notification event.
+ * Leader death notification event for cdev-based devices.
  *
  * Third-party modules fire this event when a resource that may be a
- * coalition leader dies. Coalition handles lookup and termination.
+ * coalition leader is revoked. Coalition handles lookup and termination.
  *
  * Usage:
- *     EVENTHANDLER_INVOKE(vbsd_leader_died, fp);
+ *     EVENTHANDLER_INVOKE(vbsd_leader_died_cdev, dev, priv);
  *
  * Or use the convenience macro:
- *     VBSD_LEADER_DIED(fp);
+ *     VBSD_LEADER_DIED(dev, priv);
  */
-typedef void (*vbsd_leader_died_fn)(void *arg, struct file *fp);
-EVENTHANDLER_DECLARE(vbsd_leader_died, vbsd_leader_died_fn);
+typedef void (*vbsd_leader_died_cdev_fn)(void *arg, struct cdev *dev,
+	    void *priv);
+EVENTHANDLER_DECLARE(vbsd_leader_died_cdev, vbsd_leader_died_cdev_fn);
 
-#define VBSD_LEADER_DIED(fp)	EVENTHANDLER_INVOKE(vbsd_leader_died, fp)
+#define VBSD_LEADER_DIED(dev, priv) \
+	EVENTHANDLER_INVOKE(vbsd_leader_died_cdev, dev, priv)
+
 #ifdef _SYS_MODULE_H_
 static __inline bool
 vbsd_coalition_available(void)
@@ -151,6 +156,24 @@ vbsd_coalition_available(void)
 
 	return (module_lookupbyname("vbsd_coalition") != NULL);
 }
+
+/*
+ * Convenience macros for optional coalition integration.
+ * These handle the vbsd_coalition_available() check automatically.
+ *
+ * VBSD_TERMINATE_OPS_REGISTER: Returns 0 if coalition not loaded.
+ * VBSD_TERMINATE_OPS_DEREGISTER: No-op if coalition not loaded.
+ */
+#define VBSD_TERMINATE_OPS_REGISTER(dev, ops) \
+	(vbsd_coalition_available() ? \
+	    vbsd_terminate_ops_register((dev), (ops)) : 0)
+
+#define VBSD_TERMINATE_OPS_DEREGISTER(dev) \
+	do { \
+		if (vbsd_coalition_available()) \
+			vbsd_terminate_ops_deregister((dev)); \
+	} while (0)
+
 #endif /* _SYS_MODULE_H_ */
 
 /* Internal Structures */
@@ -194,10 +217,13 @@ struct vbsd_member {
 	TAILQ_ENTRY(vbsd_member)	vm_link;
 	LIST_ENTRY(vbsd_member)		vm_hash;
 	struct file			*vm_fp;
-	struct vbsd_member_ops		*vm_ops;
 	struct vbsd_coalition		*vm_coalition;
 	void				*vm_data;
 	int				vm_dtype;
+	/* cdev-based termination (DTYPE_VNODE character devices) */
+	struct cdev			*vm_cdev;
+	void				*vm_cdev_priv;
+	struct vbsd_terminate_ops	*vm_term_ops;
 };
 
 #endif /* _VBSD_COALITION_INTERNAL */

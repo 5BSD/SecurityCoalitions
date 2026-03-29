@@ -83,7 +83,7 @@ Apple's macOS/iOS also has a feature called "coalitions" (introduced in OS X 10.
               │     close(coalition_fd)      │
               │                              │
               │  For each member:            │
-              │    1. mo_terminate(fp)       │
+              │    1. Terminate (type-based) │
               │    2. fdrop(fp)              │
               └──────────────────────────────┘
 ```
@@ -171,65 +171,91 @@ close(coalition_fd);
 ```c
 #include <sys/vbsd_coalition.h>
 
-struct vbsd_member_ops {
-    int         (*mo_terminate)(struct file *fp, struct thread *td);
-    const char  *mo_name;
-    uint32_t    mo_flags;       /* MOF_* flags */
+/*
+ * Termination operations for cdev-based custom devices.
+ *
+ * Modules using devfs_set_cdevpriv() register termination handlers here.
+ * When a coalition containing the device is terminated, the handler is
+ * called with the devfs private data.
+ */
+struct vbsd_terminate_ops {
+    int         (*vto_terminate)(void *priv, struct thread *td);
+    const char  *vto_name;
+    uint32_t    vto_flags;
 };
 
-/* mo_flags */
-#define MOF_CAN_LEAD    0x0001  /* This type can be a coalition leader */
+/* vto_flags */
+#define VTO_CAN_LEAD    0x0001  /* This device can be a coalition leader */
 
 /*
- * Register ops for a custom descriptor type. Coalition assigns the dtype.
- * Use the returned dtype in finit() when creating descriptors.
- *
- * Returns: 0 on success, dtype stored in *dtype_out
- * Errors:
- *   EINVAL - ops/dtype_out NULL, or mo_terminate NULL
- *   ENOSPC - too many external types registered
- */
-int vbsd_member_ops_register(struct vbsd_member_ops *ops, int *dtype_out);
-
-/*
- * Deregister ops for a custom descriptor type.
+ * Register termination ops for a cdev. The cdev must already exist.
+ * When fds opened from this cdev are enlisted in a coalition, the
+ * coalition will call vto_terminate() on coalition close.
  *
  * Returns: 0 on success
  * Errors:
- *   ENOENT - dtype not found
- *   EBUSY  - active members using this dtype (cannot unload)
+ *   EINVAL - dev/ops NULL, or vto_terminate NULL
+ *   EEXIST - ops already registered for this cdev
  */
-int vbsd_member_ops_deregister(int dtype);
+int vbsd_terminate_ops_register(struct cdev *dev,
+    struct vbsd_terminate_ops *ops);
+
+/*
+ * Deregister termination ops for a cdev.
+ *
+ * Returns: 0 on success
+ * Errors:
+ *   ENOENT - ops not found for this cdev
+ */
+int vbsd_terminate_ops_deregister(struct cdev *dev);
 
 /* Check if coalition module is loaded (for optional integration) */
 bool vbsd_coalition_available(void);
 
 /*
- * Third-party leader death notification.
+ * Convenience macros for optional coalition integration.
+ * These handle the vbsd_coalition_available() check automatically.
  *
- * If your custom descriptor type can be a coalition leader (MOF_CAN_LEAD),
+ * VBSD_TERMINATE_OPS_REGISTER: Returns 0 if coalition not loaded.
+ * VBSD_TERMINATE_OPS_DEREGISTER: No-op if coalition not loaded.
+ */
+#define VBSD_TERMINATE_OPS_REGISTER(dev, ops) ...
+#define VBSD_TERMINATE_OPS_DEREGISTER(dev) ...
+
+/*
+ * Third-party leader death notification for cdev-based devices.
+ *
+ * If your custom device can be a coalition leader (VTO_CAN_LEAD),
  * fire this event when the resource dies/is revoked. Coalition handles
  * the lookup and triggers termination.
  *
  * Usage in your revoke/close handler:
- *     VBSD_LEADER_DIED(fp);
+ *     VBSD_LEADER_DIED(dev, priv);
  *
  * The coalition module registers an EVENTHANDLER for this event.
  */
-#define VBSD_LEADER_DIED(fp)  EVENTHANDLER_INVOKE(vbsd_leader_died, fp)
+typedef void (*vbsd_leader_died_cdev_fn)(void *arg, struct cdev *dev,
+    void *priv);
+EVENTHANDLER_DECLARE(vbsd_leader_died_cdev, vbsd_leader_died_cdev_fn);
+
+#define VBSD_LEADER_DIED(dev, priv) \
+    EVENTHANDLER_INVOKE(vbsd_leader_died_cdev, dev, priv)
 ```
 
 ## Implementing Coalition Support in Your Module
 
-### Implementing Custom Ops
+### Using the Standard Device Model
+
+Coalition uses the standard FreeBSD device model with `devfs_set_cdevpriv()`.
+This provides DTYPE_VNODE file descriptors with full MACF label support.
 
 ```c
-static int your_dtype = DTYPE_NONE;
+static struct cdev *your_dev;
 
 static int
-your_terminate(struct file *fp, struct thread *td)
+your_terminate(void *priv, struct thread *td)
 {
-    struct your_data *yd = fp->f_data;
+    struct your_data *yd = priv;
 
     YOUR_LOCK(yd);
     yd->revoked = true;
@@ -238,77 +264,96 @@ your_terminate(struct file *fp, struct thread *td)
     return (0);
 }
 
-static struct vbsd_member_ops your_ops = {
-    .mo_terminate = your_terminate,
-    .mo_name      = "yourtype",
+static struct vbsd_terminate_ops your_terminate_ops = {
+    .vto_terminate = your_terminate,
+    .vto_name      = "yourtype",
 };
 
-/* At module load: register and get assigned dtype */
-if (vbsd_coalition_available()) {
-    error = vbsd_member_ops_register(&your_ops, &your_dtype);
-    if (error != 0)
-        return (error);
+static void
+your_dtor(void *arg)
+{
+    struct your_data *yd = arg;
+    your_free(yd);
 }
 
-/* In d_fdopen: use the assigned dtype */
+/* In d_open: use devfs_set_cdevpriv() for private data */
 static int
-your_fdopen(struct cdev *dev, int oflags, struct thread *td, struct file *fp)
+your_open(struct cdev *dev, int oflags, int devtype, struct thread *td)
 {
     struct your_data *yd = your_alloc();
-    finit(fp, FREAD | FWRITE, your_dtype, yd, &your_fileops);
+    yd->yd_cdev = dev;   /* Store cdev for VBSD_LEADER_DIED */
+    devfs_set_cdevpriv(yd, your_dtor);
     return (0);
 }
 
+/* In d_ioctl: retrieve private data */
+static int
+your_ioctl(struct cdev *dev, u_long cmd, caddr_t data,
+    int fflag, struct thread *td)
+{
+    struct your_data *yd;
+    int error;
+
+    error = devfs_get_cdevpriv((void **)&yd);
+    if (error != 0)
+        return (error);
+
+    /* ... ioctl handling ... */
+}
+
+static struct cdevsw your_cdevsw = {
+    .d_version = D_VERSION,
+    .d_open = your_open,
+    .d_close = your_close,
+    .d_ioctl = your_ioctl,
+    .d_name = "yourdev",
+};
+
+/* At module load: create device, then register with coalition */
+your_dev = make_dev(&your_cdevsw, 0, UID_ROOT, GID_WHEEL, 0600, "yourdev");
+error = VBSD_TERMINATE_OPS_REGISTER(your_dev, &your_terminate_ops);
+if (error != 0) {
+    destroy_dev(your_dev);
+    return (error);
+}
+
 /* At module unload */
-vbsd_member_ops_deregister(your_dtype);
+VBSD_TERMINATE_OPS_DEREGISTER(your_dev);
+destroy_dev(your_dev);
 ```
 
 ### Implementing Third-Party Leader Support
 
-If your custom descriptor type should be able to act as a coalition leader
-(triggering termination when it dies/is revoked), set `MOF_CAN_LEAD` in your ops
+If your custom device should be able to act as a coalition leader
+(triggering termination when it dies/is revoked), set `VTO_CAN_LEAD` in your ops
 and fire `VBSD_LEADER_DIED` when the resource dies:
 
 ```c
-static struct vbsd_member_ops your_ops = {
-    .mo_terminate = your_terminate,
-    .mo_name      = "yourtype",
-    .mo_flags     = MOF_CAN_LEAD,   /* Allow as coalition leader */
+static struct vbsd_terminate_ops your_terminate_ops = {
+    .vto_terminate = your_terminate,
+    .vto_name      = "yourtype",
+    .vto_flags     = VTO_CAN_LEAD,   /* Allow as coalition leader */
 };
 
 /* In your revoke/close/death handler */
 static int
 your_revoke(struct your_data *yd)
 {
-    struct file *fp;
-
     YOUR_LOCK(yd);
     yd->revoked = true;
-    fp = yd->yd_fp;    /* fp stored during fdopen */
     YOUR_UNLOCK(yd);
 
     /* Notify coalition if this was a leader */
-    if (fp != NULL && vbsd_coalition_available())
-        VBSD_LEADER_DIED(fp);
+    if (yd->yd_cdev != NULL && vbsd_coalition_available())
+        VBSD_LEADER_DIED(yd->yd_cdev, yd);
 
-    return (0);
-}
-
-/* In d_fdopen: store fp for later VBSD_LEADER_DIED */
-static int
-your_fdopen(struct cdev *dev, int oflags, struct thread *td, struct file *fp)
-{
-    struct your_data *yd = your_alloc();
-    yd->yd_fp = fp;    /* Store for VBSD_LEADER_DIED */
-    finit(fp, FREAD | FWRITE, your_dtype, yd, &your_fileops);
     return (0);
 }
 ```
 
-**Note**: The `fp` pointer is safe to use after releasing your lock because:
-1. The ioctl caller holds an fd reference to the file
-2. `fo_close` is only called when the last reference is dropped
-3. If you're inside an ioctl, the file won't be freed until you return
+**Note**: The cdev-based API passes the private data pointer directly to
+`VBSD_LEADER_DIED`, which the coalition uses to look up the member. This
+is safe because the destructor won't be called until the fd is closed.
 
 ## Handling Natural Exit
 
@@ -330,14 +375,14 @@ Handled via prison OSD destructor:
 
 These don't have natural exit events:
 - Stay enlisted until coalition closes
-- mo_terminate called, then fdrop()
+- Type-specific termination, then fdrop()
 
 ## Lock Order
 
 ```
 vbsd_proc_hash_lock (rwlock)
     → vbsd_leader_hash_lock (mutex)
-        → vbsd_external_ops_lock (mutex)
+        → vbsd_cdev_ops_lock (mutex)
             → vc_sx (coalition sx lock)
                 → child vc_sx (nested coalitions: parent before child)
 ```
@@ -368,14 +413,15 @@ The coalition holds its own reference via `fhold()`. Caller can continue using t
 
 ## Built-in Types
 
-The coalition module registers ops for these types at load:
+Coalition handles these descriptor types with inline termination logic:
 
-| DTYPE | Resource | mo_terminate | Interior Revocation |
-|-------|----------|--------------|---------------------|
+| DTYPE | Resource | Termination Action | Interior Revocation |
+|-------|----------|-------------------|---------------------|
 | DTYPE_PROCDESC | Process descriptor | `kern_psignal(SIGKILL)` | Yes - process killed |
 | DTYPE_JAILDESC | Jail descriptor | `prison_remove()` | Yes - jail destroyed |
 | DTYPE_SOCKET | Socket | `soshutdown(SHUT_RDWR)` | Yes - connection killed |
 | DTYPE_SHM | POSIX shared memory | `fo_truncate(0)` | Yes - SIGBUS on access |
+| DTYPE_VNODE (cdev) | Custom device | `vto_terminate(priv, td)` | Depends on device |
 | DTYPE_VNODE | File/vnode | no-op | No |
 | DTYPE_PIPE | Pipe | no-op | No |
 | DTYPE_FIFO | Named pipe (FIFO) | no-op | No |
@@ -384,9 +430,10 @@ The coalition module registers ops for these types at load:
 | DTYPE_EVENTFD | Eventfd | no-op | No |
 | DTYPE_TIMERFD | Timerfd | no-op | No |
 | DTYPE_INOTIFY | Inotify | no-op | No |
-| DTYPE_DEV | Device | no-op | No (custom ops can override) |
 
-Types without registered ops use default no-op behavior. External modules register custom ops via `vbsd_member_ops_register()`.
+Custom device modules register termination handlers via `vbsd_terminate_ops_register()`.
+When a DTYPE_VNODE fd from a registered cdev is enlisted, coalition looks up the
+termination ops by cdev and calls `vto_terminate()` on coalition close.
 
 ## Nested Coalitions
 
@@ -522,12 +569,12 @@ ioctl(coalition_fd, VBSD_COALITION_SET_LEADER, &no_leader);
 - Process (procdesc): triggers on process exit
 - Jail (jaildesc): triggers on jail destruction
 - Coalition: triggers when nested coalition terminates
-- Third-party types with `MOF_CAN_LEAD` flag: triggers when module fires `VBSD_LEADER_DIED(fp)`
+- Custom devices with `VTO_CAN_LEAD` flag: triggers when module fires `VBSD_LEADER_DIED(dev, priv)`
 
 **Requirements**:
 - The member must be enlisted in the coalition (ESRCH if not)
 - For built-in types: must be process, jail, or coalition (EINVAL for other types)
-- For third-party types: `mo_flags` must include `MOF_CAN_LEAD` (EINVAL otherwise)
+- For custom devices: `vto_flags` must include `VTO_CAN_LEAD` (EINVAL otherwise)
 - Cannot set leader on a terminated coalition (ESHUTDOWN)
 
 **Behavior**:
@@ -668,12 +715,12 @@ SecurityCoalitions/
 ### Sample: KeyVault Module
 
 The `samples/keyvault/` directory contains a complete example of a third-party
-kernel module integrating with coalition:
+kernel module integrating with coalition using the standard device model:
 
-- Custom descriptor type with interior revocation
-- Coalition terminate callback (zeros cryptographic keys)
-- `MOF_CAN_LEAD` flag (keyvault can be coalition leader)
-- `VBSD_LEADER_DIED` event on key revocation
+- Uses `devfs_set_cdevpriv()` for per-fd private data (returns DTYPE_VNODE)
+- Coalition terminate callback via `vbsd_terminate_ops` (zeros cryptographic keys)
+- `VTO_CAN_LEAD` flag (keyvault can be coalition leader)
+- `VBSD_LEADER_DIED(dev, priv)` event on key revocation
 
 Build and load:
 ```sh
@@ -779,7 +826,7 @@ sudo kldload ./samples/keyvault/vbsd_keyvault.ko
 | Nested self-enlist | `test_nested_coalition_self_enlist` | EINVAL |
 | Nested depth limit | `test_nested_coalition_depth_limit` | ELOOP at limit |
 | Third-party leader | `test_leader_thirdparty_keyvault` | keyvault revoke triggers termination |
-| Third-party terminate | `test_thirdparty_terminate_callback` | mo_terminate called on coalition close |
+| Third-party terminate | `test_thirdparty_terminate_callback` | vto_terminate called on coalition close |
 | Third-party stats | `test_thirdparty_enlist_stats` | stats reflect keyvault member |
 | Third-party leader clear | `test_thirdparty_leader_clear` | clearing leader prevents trigger |
 | Third-party leader change | `test_thirdparty_leader_change` | A→B, A's death doesn't trigger |
@@ -932,7 +979,9 @@ dtrace -n 'vbsd_coalition:::enlist__set {
 | 13 | `DTYPE_PROCDESC` | Process descriptor |
 | 20 | `DTYPE_DEV` | Device |
 | 23 | `DTYPE_JAILDESC` | Jail descriptor |
-| 64+ | Custom | External module types (assigned by coalition) |
+
+**Note**: Custom devices (e.g., keyvault) use `DTYPE_VNODE` via the standard device
+model. Termination ops are looked up by cdev, not dtype.
 
 ## Limitations
 
