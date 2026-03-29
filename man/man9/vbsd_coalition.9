@@ -1,0 +1,245 @@
+.\" SPDX-License-Identifier: BSD-2-Clause
+.\"
+.\" Copyright (c) 2026 Project5BSD
+.\"
+.Dd March 28, 2026
+.Dt VBSD_COALITION 9
+.Os
+.Sh NAME
+.Nm vbsd_coalition ,
+.Nm VBSD_TERMINATE_OPS_REGISTER ,
+.Nm VBSD_TERMINATE_OPS_DEREGISTER ,
+.Nm VBSD_LEADER_DIED ,
+.Nm vbsd_coalition_available
+.Nd kernel interface for coalition integration
+.Sh SYNOPSIS
+.In sys/vbsd_coalition.h
+.Ft int
+.Fn VBSD_TERMINATE_OPS_REGISTER "struct cdev *dev" "struct vbsd_terminate_ops *ops"
+.Ft void
+.Fn VBSD_TERMINATE_OPS_DEREGISTER "struct cdev *dev"
+.Ft void
+.Fn VBSD_LEADER_DIED "struct cdev *dev" "void *priv"
+.Ft bool
+.Fn vbsd_coalition_available "void"
+.Sh DESCRIPTION
+The
+.Nm
+kernel interface allows device drivers to integrate with the coalition
+subsystem.
+When file descriptors opened from a registered device are enlisted in
+a coalition, the driver's termination callback is invoked when the
+coalition terminates.
+.Pp
+Drivers use the standard
+.Fx
+device model with
+.Xr devfs_set_cdevpriv 9
+for per-fd private data.
+This provides
+.Dv DTYPE_VNODE
+file descriptors with full MAC framework label support.
+.Ss Registration
+Device drivers register termination operations at module load time:
+.Bd -literal -offset indent
+static struct vbsd_terminate_ops mydev_ops = {
+    .vto_terminate = mydev_terminate,
+    .vto_name = "mydev",
+    .vto_flags = VTO_CAN_LEAD,  /* optional */
+};
+
+/* MOD_LOAD */
+mydev_cdev = make_dev(&mydev_cdevsw, ...);
+error = VBSD_TERMINATE_OPS_REGISTER(mydev_cdev, &mydev_ops);
+
+/* MOD_UNLOAD */
+VBSD_TERMINATE_OPS_DEREGISTER(mydev_cdev);
+destroy_dev(mydev_cdev);
+.Ed
+.Pp
+The
+.Fn VBSD_TERMINATE_OPS_REGISTER
+and
+.Fn VBSD_TERMINATE_OPS_DEREGISTER
+macros handle the
+.Fn vbsd_coalition_available
+check internally, returning 0 if the coalition module is not loaded.
+.Ss Termination Callback
+The termination callback is invoked when a coalition containing an
+enlisted fd from the device is terminated:
+.Bd -literal -offset indent
+static int
+mydev_terminate(void *priv, struct thread *td)
+{
+    struct mydev_softc *sc = priv;
+
+    MYDEV_LOCK(sc);
+    sc->revoked = true;
+    wakeup(sc);
+    MYDEV_UNLOCK(sc);
+    return (0);
+}
+.Ed
+.Pp
+The
+.Fa priv
+argument is the private data set via
+.Xr devfs_set_cdevpriv 9
+when the file was opened.
+.Ss Leader Support
+Devices can act as coalition leaders.
+When the resource is revoked or dies, the coalition is terminated.
+.Pp
+To enable leader support:
+.Bl -enum -compact
+.It
+Set
+.Dv VTO_CAN_LEAD
+in
+.Va vto_flags
+.It
+Call
+.Fn VBSD_LEADER_DIED
+when the resource is revoked
+.El
+.Bd -literal -offset indent
+static struct vbsd_terminate_ops mydev_ops = {
+    .vto_terminate = mydev_terminate,
+    .vto_name = "mydev",
+    .vto_flags = VTO_CAN_LEAD,
+};
+
+static int
+mydev_revoke(struct mydev_softc *sc)
+{
+    MYDEV_LOCK(sc);
+    sc->revoked = true;
+    MYDEV_UNLOCK(sc);
+
+    /* Notify coalition if this was a leader */
+    VBSD_LEADER_DIED(sc->sc_cdev, sc);
+    return (0);
+}
+.Ed
+.Pp
+The
+.Fn VBSD_LEADER_DIED
+macro fires an event.
+If the coalition module is loaded and this device was set as a leader
+via
+.Dv VBSD_COALITION_SET_LEADER ,
+the coalition will be terminated.
+If the coalition module is not loaded, the event has no effect.
+.Sh DATA STRUCTURES
+.Bd -literal
+struct vbsd_terminate_ops {
+    int       (*vto_terminate)(void *priv, struct thread *td);
+    const char *vto_name;
+    uint32_t   vto_flags;
+};
+
+/* vto_flags */
+#define VTO_CAN_LEAD    0x0001  /* Device can be a coalition leader */
+.Ed
+.Sh RETURN VALUES
+.Fn VBSD_TERMINATE_OPS_REGISTER
+returns 0 on success.
+If the coalition module is not loaded, it returns 0.
+Otherwise it may return:
+.Bl -tag -width Er
+.It Bq Er EINVAL
+.Fa dev
+or
+.Fa ops
+is NULL, or
+.Va vto_terminate
+is NULL.
+.It Bq Er EEXIST
+Operations already registered for this device.
+.El
+.Pp
+.Fn vbsd_coalition_available
+returns
+.Dv true
+if the coalition kernel module is loaded,
+.Dv false
+otherwise.
+.Sh EXAMPLES
+A complete example integrating a device with coalition:
+.Bd -literal -offset indent
+#include <sys/vbsd_coalition.h>
+
+static struct cdev *mydev_cdev;
+
+static int
+mydev_terminate(void *priv, struct thread *td)
+{
+    struct mydev_softc *sc = priv;
+    sc->revoked = true;
+    return (0);
+}
+
+static struct vbsd_terminate_ops mydev_ops = {
+    .vto_terminate = mydev_terminate,
+    .vto_name = "mydev",
+    .vto_flags = VTO_CAN_LEAD,
+};
+
+static void
+mydev_dtor(void *arg)
+{
+    struct mydev_softc *sc = arg;
+    free(sc, M_MYDEV);
+}
+
+static int
+mydev_open(struct cdev *dev, int oflags, int devtype,
+    struct thread *td)
+{
+    struct mydev_softc *sc;
+
+    sc = malloc(sizeof(*sc), M_MYDEV, M_WAITOK | M_ZERO);
+    sc->sc_cdev = dev;
+    devfs_set_cdevpriv(sc, mydev_dtor);
+    return (0);
+}
+
+static int
+mydev_modevent(module_t mod, int type, void *arg)
+{
+    int error;
+
+    switch (type) {
+    case MOD_LOAD:
+        mydev_cdev = make_dev(&mydev_cdevsw, 0,
+            UID_ROOT, GID_WHEEL, 0600, "mydev");
+        error = VBSD_TERMINATE_OPS_REGISTER(mydev_cdev,
+            &mydev_ops);
+        if (error != 0) {
+            destroy_dev(mydev_cdev);
+            return (error);
+        }
+        return (0);
+
+    case MOD_UNLOAD:
+        VBSD_TERMINATE_OPS_DEREGISTER(mydev_cdev);
+        destroy_dev(mydev_cdev);
+        return (0);
+
+    default:
+        return (EOPNOTSUPP);
+    }
+}
+.Ed
+.Sh SEE ALSO
+.Xr vbsd_coalition 4 ,
+.Xr devfs_set_cdevpriv 9 ,
+.Xr eventhandler 9 ,
+.Xr make_dev 9
+.Sh HISTORY
+The
+.Nm
+interface first appeared in
+.Fx 15.0 .
+.Sh AUTHORS
+.An Project5BSD

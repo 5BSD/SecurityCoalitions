@@ -1,0 +1,224 @@
+.\" SPDX-License-Identifier: BSD-2-Clause
+.\"
+.\" Copyright (c) 2026 Project5BSD
+.\"
+.Dd March 28, 2026
+.Dt VBSD_COALITION 4
+.Os
+.Sh NAME
+.Nm vbsd_coalition
+.Nd capability-based resource group management
+.Sh SYNOPSIS
+.In sys/vbsd_coalition.h
+.Pp
+.Fd #include <sys/ioctl.h>
+.Fd #include <fcntl.h>
+.Sh DESCRIPTION
+The
+.Nm
+device provides capability-based resource group management for
+.Fx .
+A coalition groups file descriptors representing capabilities (processes,
+jails, sockets, devices, etc.) that should be terminated together when
+the coalition is closed.
+.Pp
+Opening
+.Pa /dev/vbsd_coalition
+creates a new coalition.
+The returned file descriptor represents the authority to terminate all
+enlisted members.
+Closing the coalition fd terminates all members.
+.Ss Enlisting Members
+Members are enlisted using
+.Xr ioctl 2 :
+.Bd -literal -offset indent
+int member_fd = /* procdesc, jaildesc, socket, etc. */;
+ioctl(coalition_fd, VBSD_COALITION_ENLIST, &member_fd);
+.Ed
+.Pp
+The coalition takes a reference to the file descriptor.
+The caller retains their fd and can continue using it.
+Enlistment is one-way; members cannot be removed except by coalition
+termination.
+.Ss Self-Join
+A process can join itself to a coalition:
+.Bd -literal -offset indent
+ioctl(coalition_fd, VBSD_COALITION_JOIN, NULL);
+.Ed
+.Pp
+The process will be terminated when the coalition closes.
+.Ss Termination
+Termination occurs when:
+.Bl -bullet -compact
+.It
+The coalition fd is closed (last reference dropped)
+.It
+.Dv VBSD_COALITION_TERMINATE
+ioctl is called
+.It
+A deadline or watchdog timer expires
+.It
+The designated leader dies
+.El
+.Pp
+On termination:
+.Bl -bullet -compact
+.It
+Processes receive SIGKILL (or configured signal)
+.It
+Jails are removed via
+.Xr jail_remove 2
+.It
+Sockets are shut down
+.It
+Custom devices have their termination callback invoked
+.El
+.Sh IOCTLS
+.Bl -tag -width VBSD_COALITION_TERMINATE_GRACEFUL
+.It Dv VBSD_COALITION_ENLIST
+Enlist a file descriptor in the coalition.
+Argument is a pointer to
+.Vt int
+containing the fd to enlist.
+.It Dv VBSD_COALITION_ENLIST_SET
+Enlist multiple file descriptors at once.
+Argument is a pointer to
+.Vt struct vbsd_enlist_set .
+Stops on first error;
+.Va enlisted
+field returns count of successful enlistments.
+.It Dv VBSD_COALITION_JOIN
+Self-join: the calling process joins the coalition.
+No argument.
+.It Dv VBSD_COALITION_TERMINATE
+Immediately terminate all coalition members.
+No argument.
+.It Dv VBSD_COALITION_TERMINATE_GRACEFUL
+Send a signal first, then SIGKILL after timeout.
+Argument is a pointer to
+.Vt struct vbsd_graceful .
+.It Dv VBSD_COALITION_STAT
+Query coalition status.
+Argument is a pointer to
+.Vt struct vbsd_coalition_stat .
+.It Dv VBSD_COALITION_SET_SIGNAL
+Set the termination signal (default SIGKILL).
+Argument is a pointer to
+.Vt int .
+.It Dv VBSD_COALITION_SET_DEADLINE
+Set automatic termination after timeout.
+Argument is a pointer to
+.Vt struct vbsd_deadline .
+Set
+.Va vd_timeout_ms
+to 0 to cancel.
+.It Dv VBSD_COALITION_SET_WATCHDOG
+Enable watchdog timer requiring periodic heartbeats.
+Argument is a pointer to
+.Vt uint32_t
+containing timeout in milliseconds.
+Set to 0 to disable.
+.It Dv VBSD_COALITION_HEARTBEAT
+Reset the watchdog timer.
+No argument.
+.It Dv VBSD_COALITION_SET_LEADER
+Designate a member as leader; its death triggers coalition termination.
+Argument is a pointer to
+.Vt int
+containing the fd.
+Set to -1 to clear.
+.It Dv VBSD_COALITION_RUSAGE
+Get aggregate resource usage for all process members.
+Argument is a pointer to
+.Vt struct vbsd_coalition_rusage .
+.El
+.Sh KQUEUE
+Coalition file descriptors support
+.Xr kqueue 2
+with
+.Dv EVFILT_READ .
+Events are delivered in
+.Va fflags :
+.Bl -tag -width VBSD_NOTE_MEMBER_REMOVED -compact
+.It Dv VBSD_NOTE_MEMBER_ADDED
+New member enlisted
+.It Dv VBSD_NOTE_MEMBER_REMOVED
+Member exited or removed
+.It Dv VBSD_NOTE_TERMINATING
+Termination started
+.It Dv VBSD_NOTE_TERMINATED
+All members terminated
+.It Dv VBSD_NOTE_LEADER_DIED
+Leader death triggered termination
+.It Dv VBSD_NOTE_DEADLINE_FIRED
+Deadline timer expired
+.It Dv VBSD_NOTE_WATCHDOG_FIRED
+Watchdog timeout
+.It Dv VBSD_NOTE_GRACE_STARTED
+Grace period began
+.El
+.Sh CAPSICUM
+Coalition file descriptors work with
+.Xr capsicum 4 .
+Use
+.Xr cap_ioctls_limit 2
+to restrict available ioctls:
+.Bd -literal -offset indent
+unsigned long cmds[] = { VBSD_COALITION_ENLIST, VBSD_COALITION_STAT };
+cap_ioctls_limit(coalition_fd, cmds, nitems(cmds));
+.Ed
+.Sh FILES
+.Bl -tag -width /dev/vbsd_coalition
+.It Pa /dev/vbsd_coalition
+Coalition device node
+.El
+.Sh EXAMPLES
+Create a coalition and enlist a child process:
+.Bd -literal -offset indent
+int coalition_fd, proc_fd;
+pid_t pid;
+
+coalition_fd = open("/dev/vbsd_coalition", O_RDWR);
+
+pid = pdfork(&proc_fd, 0);
+if (pid == 0) {
+    /* child */
+    execl("/bin/worker", "worker", NULL);
+}
+
+/* Enlist child in coalition */
+ioctl(coalition_fd, VBSD_COALITION_ENLIST, &proc_fd);
+
+/* ... later ... */
+close(coalition_fd);  /* Terminates child */
+.Ed
+.Sh ERRORS
+.Bl -tag -width Er
+.It Bq Er EBUSY
+Resource already enlisted in a coalition.
+.It Bq Er EINVAL
+Coalition is terminating, invalid signal, or invalid leader type.
+.It Bq Er EBADF
+Invalid file descriptor.
+.It Bq Er ESRCH
+Process or jail no longer exists, or leader not enlisted.
+.It Bq Er ESHUTDOWN
+Coalition already terminated.
+.It Bq Er ENOMEM
+Resource limit exceeded.
+.It Bq Er ELOOP
+Nesting depth limit exceeded.
+.El
+.Sh SEE ALSO
+.Xr jail 2 ,
+.Xr kqueue 2 ,
+.Xr pdfork 2 ,
+.Xr capsicum 4 ,
+.Xr vbsd_coalition 9
+.Sh HISTORY
+The
+.Nm
+device first appeared in
+.Fx 15.0 .
+.Sh AUTHORS
+.An Project5BSD
