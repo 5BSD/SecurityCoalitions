@@ -233,7 +233,7 @@ keyvault_revoke(struct keyvault *kv)
 	 * This is a security feature: if key material is compromised,
 	 * all dependent processes are terminated.
 	 */
-	if (kv->kv_cdev != NULL && vbsd_coalition_available())
+	if (kv->kv_cdev != NULL)
 		VBSD_LEADER_DIED(kv->kv_cdev, kv);
 
 	return (0);
@@ -332,8 +332,8 @@ keyvault_modevent(module_t mod __unused, int type, void *arg __unused)
 			return (ENXIO);
 		}
 
-		/* Register termination handler with coalition (if loaded) */
-		error = VBSD_TERMINATE_OPS_REGISTER(keyvault_dev,
+		/* Register termination handler with coalition */
+		error = vbsd_terminate_ops_register(keyvault_dev,
 		    &keyvault_terminate_ops);
 		if (error != 0) {
 			log(LOG_WARNING,
@@ -348,7 +348,7 @@ keyvault_modevent(module_t mod __unused, int type, void *arg __unused)
 		return (0);
 
 	case MOD_UNLOAD:
-		VBSD_TERMINATE_OPS_DEREGISTER(keyvault_dev);
+		vbsd_terminate_ops_deregister(keyvault_dev);
 		destroy_dev(keyvault_dev);
 		uma_zdestroy(keyvault_zone);
 		return (0);
@@ -368,7 +368,7 @@ DECLARE_MODULE(vbsd_keyvault, keyvault_mod, SI_SUB_DRIVERS, SI_ORDER_MIDDLE);
 MODULE_VERSION(vbsd_keyvault, 1);
 
 /*
- * Optional dependency on vbsd_coalition.
- * If coalition is loaded, we integrate. If not, we still work.
+ * Required dependency on vbsd_coalition.
+ * Coalition must be loaded before keyvault can load.
  */
-/* MODULE_DEPEND(vbsd_keyvault, vbsd_coalition, 1, 1, 1); */
+MODULE_DEPEND(vbsd_keyvault, vbsd_coalition, 1, 1, 1);

@@ -901,8 +901,14 @@ vbsd_coalition_enlist_generic(struct vbsd_coalition *vc, struct thread *td,
 	if (is_nested_coalition) {
 		struct vbsd_coalition *nested_vc;
 
-		error = devfs_get_cdevpriv((void **)&nested_vc);
-		if (error != 0)
+		/*
+		 * Access the nested coalition's cdevpriv directly.
+		 * devfs_get_cdevpriv() would return the parent coalition's
+		 * cdevpriv (the one we're operating on via ioctl), not the
+		 * child coalition being enlisted.
+		 */
+		nested_vc = fp->f_cdevpriv->cdpd_data;
+		if (nested_vc == NULL)
 			return (EBADF);
 
 		/*
@@ -1084,10 +1090,12 @@ vbsd_coalition_enlist_generic(struct vbsd_coalition *vc, struct thread *td,
 
 		/*
 		 * For nested coalitions, update the child's nesting depth.
+		 * Access fp->f_cdevpriv->cdpd_data directly since
+		 * devfs_get_cdevpriv() would return the parent's cdevpriv.
 		 */
 		if (is_nested_coalition) {
 			struct vbsd_coalition *nested_vc;
-			(void)devfs_get_cdevpriv((void **)&nested_vc);
+			nested_vc = fp->f_cdevpriv->cdpd_data;
 			nested_vc->vc_nesting_depth = vc->vc_nesting_depth + 1;
 		}
 	}
@@ -1304,7 +1312,8 @@ vbsd_coalition_terminate(struct vbsd_coalition *vc)
 	struct vbsd_member *vm;
 	struct thread *td = curthread;
 	struct file **jail_fps;
-	int jail_count, i;
+	struct vbsd_coalition **nested_vcs;
+	int jail_count, nested_count, i;
 
 	sx_xlock(&vc->vc_sx);
 
@@ -1319,14 +1328,19 @@ vbsd_coalition_terminate(struct vbsd_coalition *vc)
 	}
 
 	/*
-	 * Count jail members so we can allocate an array to hold their
-	 * file pointers. We need to terminate jails outside the lock
-	 * to avoid deadlock with OSD destructor.
+	 * Count jail and nested coalition members so we can allocate
+	 * arrays to hold their pointers. We need to terminate both
+	 * outside the lock to avoid deadlock:
+	 * - Jails: OSD destructor needs vc_sx
+	 * - Nested coalitions: recursive termination needs child's vc_sx
 	 */
 	jail_count = 0;
+	nested_count = 0;
 	TAILQ_FOREACH(vm, &vc->vc_members, vm_link) {
 		if (vm->vm_dtype == DTYPE_JAILDESC && vm->vm_fp != NULL)
 			jail_count++;
+		else if (vm->vm_fp != NULL && vbsd_is_coalition(vm->vm_fp))
+			nested_count++;
 	}
 
 	jail_fps = NULL;
@@ -1349,10 +1363,46 @@ vbsd_coalition_terminate(struct vbsd_coalition *vc)
 		}
 	}
 
-	/* Terminate non-jail members while holding the lock */
+	nested_vcs = NULL;
+	if (nested_count > 0) {
+		nested_vcs = malloc(nested_count * sizeof(struct vbsd_coalition *),
+		    M_VBSD_COALITION, M_NOWAIT);
+		if (nested_vcs != NULL) {
+			i = 0;
+			TAILQ_FOREACH(vm, &vc->vc_members, vm_link) {
+				if (vm->vm_fp != NULL &&
+				    vbsd_is_coalition(vm->vm_fp) &&
+				    i < nested_count) {
+					struct vbsd_coalition *child_vc;
+					child_vc = vm->vm_fp->f_cdevpriv->cdpd_data;
+					if (child_vc != NULL) {
+						vbsd_coalition_ref(child_vc);
+						nested_vcs[i++] = child_vc;
+					}
+				}
+			}
+			nested_count = i;  /* Actual count */
+		} else {
+			nested_count = 0;
+		}
+	}
+
+	/* Terminate non-jail, non-nested members while holding the lock */
 	vbsd_coalition_terminate_members_locked(vc, td, false);
 
 	sx_xunlock(&vc->vc_sx);
+
+	/*
+	 * Terminate nested coalitions outside the lock to avoid deadlock.
+	 * Recursive termination needs the child coalition's vc_sx.
+	 */
+	for (i = 0; i < nested_count; i++) {
+		(void)vbsd_coalition_terminate(nested_vcs[i]);
+		vbsd_coalition_rel(nested_vcs[i]);
+	}
+
+	if (nested_vcs != NULL)
+		free(nested_vcs, M_VBSD_COALITION);
 
 	/*
 	 * Terminate jail members outside the lock to avoid deadlock.
@@ -1968,7 +2018,8 @@ vbsd_coalition_ioctl_internal(struct vbsd_coalition *vc, u_long cmd,
 						/* Coalition: clear back-pointer */
 						struct vbsd_coalition *old_child;
 
-						old_child = old_vm->vm_fp->f_data;
+						old_child =
+						    old_vm->vm_fp->f_cdevpriv->cdpd_data;
 						if (old_child != NULL) {
 							sx_xlock(&old_child->vc_sx);
 							old_child->vc_leader_of = NULL;
@@ -2025,7 +2076,8 @@ vbsd_coalition_ioctl_internal(struct vbsd_coalition *vc, u_long cmd,
 				    vbsd_is_coalition(old_vm->vm_fp)) {
 					struct vbsd_coalition *old_child;
 
-					old_child = old_vm->vm_fp->f_data;
+					old_child =
+					    old_vm->vm_fp->f_cdevpriv->cdpd_data;
 					if (old_child != NULL) {
 						sx_xlock(&old_child->vc_sx);
 						old_child->vc_leader_of = NULL;
@@ -2075,8 +2127,13 @@ vbsd_coalition_ioctl_internal(struct vbsd_coalition *vc, u_long cmd,
 				/* Nested coalition leader */
 				struct vbsd_coalition *child_vc;
 
-				error = devfs_get_cdevpriv((void **)&child_vc);
-				if (error != 0 || child_vc == NULL) {
+				/*
+				 * Access the nested coalition's cdevpriv directly.
+				 * devfs_get_cdevpriv() would return the parent
+				 * coalition's cdevpriv, not the target coalition.
+				 */
+				child_vc = target_fp->f_cdevpriv->cdpd_data;
+				if (child_vc == NULL) {
 					fdrop(target_fp, td);
 					sx_xunlock(&vc->vc_sx);
 					error = EINVAL;
@@ -2259,11 +2316,15 @@ vbsd_coalition_ioctl_internal(struct vbsd_coalition *vc, u_long cmd,
 					struct vbsd_coalition *child_vc;
 					struct vbsd_coalition_rusage child_ru;
 					struct vbsd_member *child_vm;
-					int cdev_error;
 
-					cdev_error = devfs_get_cdevpriv(
-					    (void **)&child_vc);
-					if (cdev_error != 0 || child_vc == NULL)
+					/*
+					 * Access the nested coalition's cdevpriv
+					 * directly. devfs_get_cdevpriv() would
+					 * return the wrong cdevpriv.
+					 */
+					child_vc =
+					    vm->vm_fp->f_cdevpriv->cdpd_data;
+					if (child_vc == NULL)
 						continue;
 
 					/*

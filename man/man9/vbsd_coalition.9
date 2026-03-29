@@ -7,21 +7,18 @@
 .Os
 .Sh NAME
 .Nm vbsd_coalition ,
-.Nm VBSD_TERMINATE_OPS_REGISTER ,
-.Nm VBSD_TERMINATE_OPS_DEREGISTER ,
-.Nm VBSD_LEADER_DIED ,
-.Nm vbsd_coalition_available
+.Nm vbsd_terminate_ops_register ,
+.Nm vbsd_terminate_ops_deregister ,
+.Nm VBSD_LEADER_DIED
 .Nd kernel interface for coalition integration
 .Sh SYNOPSIS
 .In sys/vbsd_coalition.h
 .Ft int
-.Fn VBSD_TERMINATE_OPS_REGISTER "struct cdev *dev" "struct vbsd_terminate_ops *ops"
-.Ft void
-.Fn VBSD_TERMINATE_OPS_DEREGISTER "struct cdev *dev"
+.Fn vbsd_terminate_ops_register "struct cdev *dev" "struct vbsd_terminate_ops *ops"
+.Ft int
+.Fn vbsd_terminate_ops_deregister "struct cdev *dev"
 .Ft void
 .Fn VBSD_LEADER_DIED "struct cdev *dev" "void *priv"
-.Ft bool
-.Fn vbsd_coalition_available "void"
 .Sh DESCRIPTION
 The
 .Nm
@@ -39,6 +36,14 @@ for per-fd private data.
 This provides
 .Dv DTYPE_VNODE
 file descriptors with full MAC framework label support.
+.Pp
+Modules using this interface must declare a dependency on
+.Nm vbsd_coalition :
+.Bd -literal -offset indent
+MODULE_DEPEND(mymodule, vbsd_coalition, 1, 1, 1);
+.Ed
+.Pp
+This ensures the coalition module is loaded before the dependent module.
 .Ss Registration
 Device drivers register termination operations at module load time:
 .Bd -literal -offset indent
@@ -50,20 +55,12 @@ static struct vbsd_terminate_ops mydev_ops = {
 
 /* MOD_LOAD */
 mydev_cdev = make_dev(&mydev_cdevsw, ...);
-error = VBSD_TERMINATE_OPS_REGISTER(mydev_cdev, &mydev_ops);
+error = vbsd_terminate_ops_register(mydev_cdev, &mydev_ops);
 
 /* MOD_UNLOAD */
-VBSD_TERMINATE_OPS_DEREGISTER(mydev_cdev);
+vbsd_terminate_ops_deregister(mydev_cdev);
 destroy_dev(mydev_cdev);
 .Ed
-.Pp
-The
-.Fn VBSD_TERMINATE_OPS_REGISTER
-and
-.Fn VBSD_TERMINATE_OPS_DEREGISTER
-macros handle the
-.Fn vbsd_coalition_available
-check internally, returning 0 if the coalition module is not loaded.
 .Ss Termination Callback
 The termination callback is invoked when a coalition containing an
 enlisted fd from the device is terminated:
@@ -124,12 +121,11 @@ mydev_revoke(struct mydev_softc *sc)
 .Pp
 The
 .Fn VBSD_LEADER_DIED
-macro fires an event.
-If the coalition module is loaded and this device was set as a leader
-via
+macro fires an event via
+.Xr eventhandler 9 .
+If this device was set as a leader via
 .Dv VBSD_COALITION_SET_LEADER ,
 the coalition will be terminated.
-If the coalition module is not loaded, the event has no effect.
 .Sh DATA STRUCTURES
 .Bd -literal
 struct vbsd_terminate_ops {
@@ -142,10 +138,8 @@ struct vbsd_terminate_ops {
 #define VTO_CAN_LEAD    0x0001  /* Device can be a coalition leader */
 .Ed
 .Sh RETURN VALUES
-.Fn VBSD_TERMINATE_OPS_REGISTER
-returns 0 on success.
-If the coalition module is not loaded, it returns 0.
-Otherwise it may return:
+.Fn vbsd_terminate_ops_register
+returns 0 on success, or one of the following errors:
 .Bl -tag -width Er
 .It Bq Er EINVAL
 .Fa dev
@@ -158,12 +152,10 @@ is NULL.
 Operations already registered for this device.
 .El
 .Pp
-.Fn vbsd_coalition_available
-returns
-.Dv true
-if the coalition kernel module is loaded,
-.Dv false
-otherwise.
+.Fn vbsd_terminate_ops_deregister
+returns 0 on success, or
+.Er ENOENT
+if no operations were registered for the device.
 .Sh EXAMPLES
 A complete example integrating a device with coalition:
 .Bd -literal -offset indent
@@ -213,7 +205,7 @@ mydev_modevent(module_t mod, int type, void *arg)
     case MOD_LOAD:
         mydev_cdev = make_dev(&mydev_cdevsw, 0,
             UID_ROOT, GID_WHEEL, 0600, "mydev");
-        error = VBSD_TERMINATE_OPS_REGISTER(mydev_cdev,
+        error = vbsd_terminate_ops_register(mydev_cdev,
             &mydev_ops);
         if (error != 0) {
             destroy_dev(mydev_cdev);
@@ -222,7 +214,7 @@ mydev_modevent(module_t mod, int type, void *arg)
         return (0);
 
     case MOD_UNLOAD:
-        VBSD_TERMINATE_OPS_DEREGISTER(mydev_cdev);
+        vbsd_terminate_ops_deregister(mydev_cdev);
         destroy_dev(mydev_cdev);
         return (0);
 
@@ -230,6 +222,10 @@ mydev_modevent(module_t mod, int type, void *arg)
         return (EOPNOTSUPP);
     }
 }
+
+DECLARE_MODULE(mydev, mydev_mod, SI_SUB_DRIVERS, SI_ORDER_MIDDLE);
+MODULE_VERSION(mydev, 1);
+MODULE_DEPEND(mydev, vbsd_coalition, 1, 1, 1);
 .Ed
 .Sh SEE ALSO
 .Xr vbsd_coalition 4 ,

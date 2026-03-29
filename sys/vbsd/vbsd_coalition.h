@@ -125,6 +125,9 @@ struct vbsd_terminate_ops {
  * Register termination ops for a cdev. The cdev must already exist.
  * When fds opened from this cdev are enlisted in a coalition, the
  * coalition will call vto_terminate() on coalition close.
+ *
+ * Modules using these functions should declare a dependency:
+ *     MODULE_DEPEND(mymodule, vbsd_coalition, 1, 1, 1);
  */
 int	vbsd_terminate_ops_register(struct cdev *dev,
 	    struct vbsd_terminate_ops *ops);
@@ -149,32 +152,6 @@ EVENTHANDLER_DECLARE(vbsd_leader_died_cdev, vbsd_leader_died_cdev_fn);
 #define VBSD_LEADER_DIED(dev, priv) \
 	EVENTHANDLER_INVOKE(vbsd_leader_died_cdev, dev, priv)
 
-#ifdef _SYS_MODULE_H_
-static __inline bool
-vbsd_coalition_available(void)
-{
-
-	return (module_lookupbyname("vbsd_coalition") != NULL);
-}
-
-/*
- * Convenience macros for optional coalition integration.
- * These handle the vbsd_coalition_available() check automatically.
- *
- * VBSD_TERMINATE_OPS_REGISTER: Returns 0 if coalition not loaded.
- * VBSD_TERMINATE_OPS_DEREGISTER: No-op if coalition not loaded.
- */
-#define VBSD_TERMINATE_OPS_REGISTER(dev, ops) \
-	(vbsd_coalition_available() ? \
-	    vbsd_terminate_ops_register((dev), (ops)) : 0)
-
-#define VBSD_TERMINATE_OPS_DEREGISTER(dev) \
-	do { \
-		if (vbsd_coalition_available()) \
-			vbsd_terminate_ops_deregister((dev)); \
-	} while (0)
-
-#endif /* _SYS_MODULE_H_ */
 
 /* Internal Structures */
 
